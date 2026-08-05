@@ -1,0 +1,5 @@
+This engine is derived from gpt-fast (https://github.com/pytorch-labs/gpt-fast),
+Copyright (c) Meta Platforms, Inc. and affiliates, licensed under BSD-3-Clause
+(see engine/LICENSE). Modifications for this project: Granite-4.1 model support,
+dynamic activation sparsity + custom sparse-int4 CUDA kernels, and a self-owned
+CUDA-graph decode loop.

@@ -1,0 +1,29 @@
+# private notes (old quorum findings + kdoc spec) — local only, not for the public repo
+kdoc/
+notes/
+
+# python / venvs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# model weights / checkpoints / caches
+*.pth
+*.safetensors
+*.bin
+checkpoints/
+*.gguf
+
+# build / profiling artifacts
+build/
+*.so
+*.ncu-rep
+*.nsys-rep
+*.csv
+*.log
+
+# claude
+.claude/
+CLAUDE.md
