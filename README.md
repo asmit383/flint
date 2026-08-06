@@ -14,7 +14,7 @@ vLLM don't ship — driven from a tight, self-owned CUDA-graph decode loop.
 - **Hardware:** H100 PCIe (2 TB/s, Hopper — for TMA / warp-specialization). MBU % is peak-independent,
   so it also holds on cheaper cards; absolute tok/s scales with bandwidth.
 
-## Baselines — measured, honest (Granite-3B, B=1, H100 PCIe 2 TB/s)
+## Baselines — measured (Granite-3B, B=1, H100 PCIe 2 TB/s)
 
 | path | tok/s | MBU | bytes/token |
 |---|---|---|---|
