@@ -69,13 +69,19 @@ PROMPTS = {
 }
 
 @torch.no_grad()
-def roll(f_i, first_tok, K):                                 # autoregressive draft from a true feature
-    out = []; fp = f_i.view(1, 1, -1); nxt = first_tok.view(1)
+def roll(feats, tokens, i, K, W=64):                         # autoregressive draft WITH context window
+    lo = max(0, i - W + 1)
+    fseq = feats[lo:i + 1].clone()                           # f_lo..f_i  (real target features = context)
+    tnext = tokens[lo + 1:i + 2].clone()                     # t_{lo+1}..t_{i+1}  (their next tokens)
+    out = []
     for _ in range(K):
-        emb = F.embedding(nxt, embed).view(1, 1, -1).to(torch.bfloat16)
-        fp = draft(fp, emb)[:, -1:]                          # predict next feature (1-step, causal ok)
-        nxt = head_tok(fp)[:, -1]
-        out.append(nxt.item())
+        emb = F.embedding(tnext, embed).to(torch.bfloat16)
+        fp = draft(fseq.unsqueeze(0), emb.unsqueeze(0))[0]   # [w,dim]; last pos predicts the next feature
+        f_new = fp[-1]
+        t_new = head_tok(f_new.view(1, 1, -1))[0, 0]
+        out.append(t_new.item())
+        fseq = torch.cat([fseq, f_new.view(1, -1)], 0)       # extend: (f_new, emb(t_new)) as next input
+        tnext = torch.cat([tnext, t_new.view(1)], 0)
     return out
 
 @torch.no_grad()
@@ -87,7 +93,7 @@ def evaluate(prompt, K):
     L = gen.shape[0]; seq = gen.tolist()
     i, passes, advanced = plen - 1, 0, 0
     while i < L - 1:
-        d = roll(feats[i], gen[i + 1], K)                    # free token = seq[i+1]; draft seq[i+2..]
+        d = roll(feats, gen, i, K)                           # free token = seq[i+1]; draft seq[i+2..]
         passes += 1
         acc = 0
         for kk in range(len(d)):
