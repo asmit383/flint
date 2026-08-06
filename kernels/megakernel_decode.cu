@@ -17,9 +17,11 @@ __device__ __forceinline__ float wgemv_row(const uint32_t* __restrict__ Wrow,
     const __nv_bfloat16* __restrict__ srow, const __nv_bfloat16* __restrict__ x, int IN, int lane) {
   const int ncols = IN >> 3; float acc = 0.f;
   for (int col = lane; col < ncols; col += 32) {
-    const uint32_t w = Wrow[col]; const float sc = __bfloat162float(srow[col >> 4]); const int k0 = col << 3;
+    const uint32_t w = Wrow[col]; const float sc = __bfloat162float(srow[col >> 4]);
+    const int4 xr = __ldg(reinterpret_cast<const int4*>(&x[col << 3]));   // 8 bf16 = one 128-bit load
+    const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xr);
     #pragma unroll
-    for (int m = 0; m < 8; m++) acc += (float((w >> (4 * m)) & 0xF) - 8.0f) * sc * __bfloat162float(x[k0 + m]);
+    for (int m = 0; m < 8; m++) acc += (float((w >> (4 * m)) & 0xF) - 8.0f) * sc * __bfloat162float(xb[m]);
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
