@@ -80,8 +80,12 @@ print("calibrating thresholds ...")
 STATE["mode"] = "calib"; STATE["collect"] = [[] for _ in range(NL)]
 with torch.no_grad():
     run_chunks(a.eval_chunks, a.eval_chunks + a.calib_chunks)
-tlayer = torch.tensor([torch.cat(c).quantile(a.target).item() for c in STATE["collect"]])
-tglobal = torch.cat([torch.cat(c) for c in STATE["collect"]]).quantile(a.target).item()
+def qtile(t, q, cap=8_000_000):
+    if t.numel() > cap: t = t[torch.randperm(t.numel())[:cap]]
+    return t.quantile(q).item()
+per_layer_cat = [torch.cat(c) for c in STATE["collect"]]
+tlayer = torch.tensor([qtile(c, a.target) for c in per_layer_cat])
+tglobal = qtile(torch.cat(per_layer_cat), a.target)
 STATE["tlayer"] = tlayer.tolist(); STATE["tglobal"] = tglobal; STATE["collect"] = None
 print(f"  global threshold {tglobal:.4f} | per-layer range [{tlayer.min():.4f}, {tlayer.max():.4f}]  "
       f"(spread {tlayer.max()/tlayer.min():.1f}x -> why global mis-sparsifies)")
