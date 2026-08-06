@@ -63,6 +63,7 @@ __device__ void attn_block(cg::grid_group& grid,
     const uint32_t* Wqkv, const __nv_bfloat16* s_qkv, const uint32_t* Wo, const __nv_bfloat16* s_o,
     const __nv_bfloat16* nw, __nv_bfloat16* h, __nv_bfloat16* kc, __nv_bfloat16* vc,
     __nv_bfloat16* xn, __nv_bfloat16* qkv, __nv_bfloat16* ao, float* red,
+    float* pm, float* pd, float* pacc, int WPH,          // flash-decode partials: WPH warps per head
     int DIM, int pos, float scale, float rope_base, float resid,
     int tid, int nthreads, int warp, int lane, int nwarps) {
   const int QKV = DIM + 2 * NKV * HD;
@@ -88,10 +89,12 @@ __device__ void attn_block(cg::grid_group& grid,
   }
   grid.sync();
   const int T = pos + 1;
-  for (int qh = warp; qh < NH; qh += nwarps) {
-    const int kv = qh / (NH / NKV); const __nv_bfloat16* q = qkv + qh * HD;
+  // Phase 3a: flash partials. warp -> (head, sub); each warp handles STRIDED timesteps (sub, sub+WPH, ...)
+  const int head = warp / WPH, sub = warp % WPH;
+  if (head < NH) {
+    const int kv = head / (NH / NKV); const __nv_bfloat16* q = qkv + head * HD;
     float mmax = -1e30f, denom = 0.f, outv[2] = {0.f, 0.f};
-    for (int t = 0; t < T; t++) {
+    for (int t = sub; t < T; t += WPH) {
       const __nv_bfloat16* kt = kc + ((size_t)t * NKV + kv) * HD; float s = 0.f;
       for (int d = lane; d < HD; d += 32) s += __bfloat162float(q[d]) * __bfloat162float(kt[d]);
       #pragma unroll
@@ -104,8 +107,22 @@ __device__ void attn_block(cg::grid_group& grid,
       for (int j = 0; j < 2; j++) outv[j] = outv[j] * corr + w * __bfloat162float(vt[lane + j * 32]);
       mmax = m2;
     }
-    #pragma unroll
-    for (int j = 0; j < 2; j++) ao[qh * HD + lane + j * 32] = __float2bfloat16(outv[j] / denom);
+    const int pidx = head * WPH + sub;
+    if (lane == 0) { pm[pidx] = mmax; pd[pidx] = denom; }        // UNnormalized partial (flash)
+    pacc[(size_t)pidx * HD + lane] = outv[0]; pacc[(size_t)pidx * HD + lane + 32] = outv[1];
+  }
+  grid.sync();
+  // Phase 3b: merge WPH partials per head (flash softmax merge)
+  for (int qh = warp; qh < NH; qh += nwarps) {
+    float gm = -1e30f;
+    for (int s = 0; s < WPH; s++) gm = fmaxf(gm, pm[qh * WPH + s]);
+    float gd = 0.f, acc0 = 0.f, acc1 = 0.f;
+    for (int s = 0; s < WPH; s++) {
+      const int pidx = qh * WPH + s; const float wt = __expf(pm[pidx] - gm);
+      gd += pd[pidx] * wt;
+      acc0 += pacc[(size_t)pidx * HD + lane] * wt; acc1 += pacc[(size_t)pidx * HD + lane + 32] * wt;
+    }
+    ao[qh * HD + lane] = __float2bfloat16(acc0 / gd); ao[qh * HD + lane + 32] = __float2bfloat16(acc1 / gd);
   }
   grid.sync();
   for (int row = warp; row < DIM; row += RSTEP * nwarps) {
@@ -146,8 +163,8 @@ __global__ void decode_mega(
     const __nv_bfloat16* nf, const uint32_t* Wlm, const __nv_bfloat16* s_lm,
     __nv_bfloat16* h, __nv_bfloat16* kc, __nv_bfloat16* vc,
     __nv_bfloat16* xn, __nv_bfloat16* qkv, __nv_bfloat16* gu, __nv_bfloat16* act, __nv_bfloat16* ao,
-    float* red, float* logits,
-    int DIM, int INTER, int NL, int VOCAB, int MAXSEQ, int pos,
+    float* red, float* pm, float* pd, float* pacc, float* logits,
+    int DIM, int INTER, int NL, int VOCAB, int MAXSEQ, int pos, int WPH,
     float scale, float rope_base, float resid, float logits_scaling) {
   cg::grid_group grid = cg::this_grid();
   const int tid = blockIdx.x * blockDim.x + threadIdx.x, nthreads = gridDim.x * blockDim.x;
@@ -162,7 +179,7 @@ __global__ void decode_mega(
 #ifndef NOATTN
     attn_block(grid, Wqkv + l * qkv_st, s_qkv + l * sqkv_st, Wo + l * wo_st, s_o + l * so_st,
                n1 + (size_t)l * DIM, h, kc + l * kc_st, vc + l * kc_st, xn, qkv, ao, red,
-               DIM, pos, scale, rope_base, resid, tid, nthreads, warp, lane, nwarps);
+               pm, pd, pacc, WPH, DIM, pos, scale, rope_base, resid, tid, nthreads, warp, lane, nwarps);
 #endif
 #ifndef NOMLP
     mlp_block(grid, n2 + (size_t)l * DIM, Wgu + l * wgu_st, s_gu + l * sgu_st, Wd + l * wd_st, s_d + l * sd_st,
@@ -192,6 +209,13 @@ torch::Tensor decode_mega_launch(
   auto gu = torch::empty({2 * INTER}, opt), act = torch::empty({INTER}, opt), ao = torch::empty({DIM}, opt);
   auto red = torch::zeros({1}, opt.dtype(torch::kFloat32));
   auto logits = torch::empty({VOCAB}, opt.dtype(torch::kFloat32));
+  int nthreads=256,dev=0; cudaGetDevice(&dev);
+  int bps=0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, decode_mega, nthreads, 0);
+  int nsm=0; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+  int grid=bps*nsm; int nwarps=grid*(nthreads>>5); int WPH=nwarps/NH; if(WPH<1)WPH=1;
+  auto pm = torch::empty({NH * WPH}, opt.dtype(torch::kFloat32));
+  auto pd = torch::empty({NH * WPH}, opt.dtype(torch::kFloat32));
+  auto pacc = torch::empty({(int64_t)NH * WPH * HD}, opt.dtype(torch::kFloat32));
   auto P = [](torch::Tensor t){ return reinterpret_cast<const uint32_t*>(t.data_ptr<int32_t>()); };
   auto B = [](torch::Tensor t){ return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr<at::BFloat16>()); };
   auto Bm = [](torch::Tensor t){ return reinterpret_cast<__nv_bfloat16*>(t.data_ptr<at::BFloat16>()); };
@@ -199,13 +223,10 @@ torch::Tensor decode_mega_launch(
   const __nv_bfloat16 *sqkv=B(s_qkv),*so=B(s_o),*n1p=B(n1),*sgu=B(s_gu),*sd=B(s_d),*n2p=B(n2),*nfp=B(nf),*slm=B(s_lm);
   __nv_bfloat16 *hp=Bm(h),*kcp=Bm(kc),*vcp=Bm(vc),*xnp=Bm(xn),*qkvp=Bm(qkv),*gup=Bm(gu),*actp=Bm(act),*aop=Bm(ao);
   float *redp=red.data_ptr<float>(),*lgp=logits.data_ptr<float>();
-  int D=DIM,I=INTER,nl=NL,V=VOCAB,ms=MAXSEQ,p2=pos; float sc=scale,rb=rope_base,rm=resid,ls=logits_scaling;
-  int nthreads=256,dev=0; cudaGetDevice(&dev);
-  int bps=0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, decode_mega, nthreads, 0);
-  int nsm=0; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
-  int grid=bps*nsm;
+  float *pmp=pm.data_ptr<float>(),*pdp=pd.data_ptr<float>(),*paccp=pacc.data_ptr<float>();
+  int D=DIM,I=INTER,nl=NL,V=VOCAB,ms=MAXSEQ,p2=pos,wph=WPH; float sc=scale,rb=rope_base,rm=resid,ls=logits_scaling;
   void* args[]={&wqkv,&sqkv,&wo,&so,&n1p,&wgu,&sgu,&wd,&sd,&n2p,&nfp,&wlm,&slm,&hp,&kcp,&vcp,
-                &xnp,&qkvp,&gup,&actp,&aop,&redp,&lgp,&D,&I,&nl,&V,&ms,&p2,&sc,&rb,&rm,&ls};
+                &xnp,&qkvp,&gup,&actp,&aop,&redp,&pmp,&pdp,&paccp,&lgp,&D,&I,&nl,&V,&ms,&p2,&wph,&sc,&rb,&rm,&ls};
   cudaLaunchCooperativeKernel((void*)decode_mega, grid, nthreads, args, 0, at::cuda::getCurrentCUDAStream());
   return logits;
 }
