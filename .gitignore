@@ -28,3 +28,4 @@ build/
 .claude/
 CLAUDE.md
 phases.md
+artifacts/
