@@ -31,6 +31,21 @@ def quant_pack(W, G=128):
     Wdq = (q * scale).view(OUT, IN).to(torch.bfloat16)          # ref, in natural K order
     return packed_i32, scales, Wdq
 
+def quant_pack_contig(W, G=128):
+    """Contiguous layout for int4_gemv_v: word j packs K-indices [j*8, j*8+8) (natural order).
+      Wq int32[OUT, IN/8], scales bf16[OUT, IN/128] (word j -> group j//16). Returns Wdq for the ref."""
+    OUT, IN = W.shape
+    Wg = W.float().view(OUT, IN // G, G)
+    scale = Wg.abs().amax(-1, keepdim=True) / 7.0
+    q = torch.clamp(torch.round(Wg / scale), -8, 7)
+    qu = (q + 8).to(torch.int64).view(OUT, IN // 8, 8)
+    shifts = (torch.arange(8, device=W.device) * 4).view(1, 1, 8)
+    packed = (qu << shifts).sum(-1)
+    packed_i32 = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32).contiguous()
+    scales = scale.squeeze(-1).to(torch.bfloat16).contiguous()
+    Wdq = (q * scale).view(OUT, IN).to(torch.bfloat16)
+    return packed_i32, scales, Wdq
+
 def graph_time(fn, iters):
     side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -94,14 +109,24 @@ if __name__ == "__main__":
             mbu = 100 * gbs * 1e9 / a.peak_bw
             if rel < 0.02 and (best is None or mbu > best[1]): best = (f"glob nacc={nacc}", mbu)
             print(f"    glob nacc={nacc}   {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
-        # global-x + split-K sweep (multiplies block count to fill SMs on few-row shapes: down)
-        nblk = IN // 256
-        for sk in [s for s in (2, 4, 8, 16) if nblk % s == 0]:
-            ysk = m.int4_gemv_gsk(Wq, scales, x.view(IN), sk, 4).float()
-            rel = (ysk - y_ref).norm().item() / (y_ref.norm().item() + 1e-9)
-            ms = graph_time(lambda: m.int4_gemv_gsk(Wq, scales, x.view(IN), sk, 4), a.iters)
+        # vectorized-x sweep (contiguous layout + 128-bit x load: 8x fewer x-load instructions)
+        Wqc, scalesc, Wdqc = quant_pack_contig(W, G)
+        yrefc = (Wdqc.float() @ x.float().view(IN)).view(OUT)
+        for nacc in a.nacc:
+            yv = m.int4_gemv_v(Wqc, scalesc, x.view(IN), nacc).float()
+            rel = (yv - yrefc).norm().item() / (yrefc.norm().item() + 1e-9)
+            ms = graph_time(lambda: m.int4_gemv_v(Wqc, scalesc, x.view(IN), nacc), a.iters)
             gbs = int4_bytes(OUT, IN) / (ms * 1e-3) / 1e9
             mbu = 100 * gbs * 1e9 / a.peak_bw
-            if rel < 0.02 and (best is None or mbu > best[1]): best = (f"gsk={sk}", mbu)
-            print(f"    gsk={sk} nacc4     {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
+            if rel < 0.02 and (best is None or mbu > best[1]): best = (f"vec nacc={nacc}", mbu)
+            print(f"    vec nacc={nacc}    {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
+        # fast-dequant sweep (magic-number int4->bf16, bf16x2 math — attacks the compute-bound wall)
+        for nacc in a.nacc:
+            yfd = m.int4_gemv_fd(Wqc, scalesc, x.view(IN), nacc).float()
+            rel = (yfd - yrefc).norm().item() / (yrefc.norm().item() + 1e-9)
+            ms = graph_time(lambda: m.int4_gemv_fd(Wqc, scalesc, x.view(IN), nacc), a.iters)
+            gbs = int4_bytes(OUT, IN) / (ms * 1e-3) / 1e9
+            mbu = 100 * gbs * 1e9 / a.peak_bw
+            if rel < 0.02 and (best is None or mbu > best[1]): best = (f"fd nacc={nacc}", mbu)
+            print(f"    fd nacc={nacc}     {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
         print(f"    best: {best[0]}  MBU {best[1]:.1f}%   (tinygemm ref: gate/up 37%, down 45%, q/o 19%)")
