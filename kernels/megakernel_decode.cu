@@ -26,14 +26,26 @@ __device__ __forceinline__ float wgemv_row(const uint32_t* __restrict__ Wrow,
   return acc;
 }
 
-// rmsnorm(h) -> xn  (grid-wide sum-of-squares via atomicAdd on red[0])
+// rmsnorm(h) -> xn.  Block-level reduction (shared) then ONE atomicAdd per block -> ~256x less atomic
+// contention than the naive per-thread atomicAdd (the megakernel's serialization killer).
 __device__ void rmsnorm(cg::grid_group& grid, const __nv_bfloat16* h, const __nv_bfloat16* nw,
                         __nv_bfloat16* xn, float* red, int DIM, int tid, int nthreads) {
   if (tid == 0) red[0] = 0.f;
   grid.sync();
   float p = 0.f;
   for (int i = tid; i < DIM; i += nthreads) { float v = __bfloat162float(h[i]); p += v * v; }
-  atomicAdd(&red[0], p);
+  __shared__ float bs[32];
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw_b = blockDim.x >> 5;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(0xffffffffu, p, o);
+  if (lane == 0) bs[w] = p;
+  __syncthreads();
+  if (w == 0) {
+    float s = (lane < nw_b) ? bs[lane] : 0.f;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) atomicAdd(&red[0], s);          // one atomic per block, not per thread
+  }
   grid.sync();
   const float r = rsqrtf(red[0] / DIM + 1e-5f);
   for (int i = tid; i < DIM; i += nthreads) xn[i] = __float2bfloat16(__bfloat162float(h[i]) * r * __bfloat162float(nw[i]));
@@ -185,6 +197,15 @@ torch::Tensor decode_mega_launch(
   return logits;
 }
 
+std::vector<int64_t> decode_occupancy() {
+  cudaFuncAttributes attr; cudaFuncGetAttributes(&attr, (const void*)decode_mega);
+  int bps = 0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, decode_mega, 256, 0);
+  int nsm = 0; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+  // {registers/thread, blocks/SM, #SMs, warps/SM, total warps}
+  return {(int64_t)attr.numRegs, (int64_t)bps, (int64_t)nsm, (int64_t)bps * 8, (int64_t)bps * nsm * 8};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode_mega_launch", &decode_mega_launch, "full-decode megakernel (persistent, B=1)");
+  m.def("decode_occupancy", &decode_occupancy, "regs/occupancy diagnostics");
 }
