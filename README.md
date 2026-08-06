@@ -57,10 +57,14 @@ naive persistent            44 tok/s   (grid-wide atomicAdd reduction = 117k thr
 (more warps / more accumulators both HURT — the kernel is register/occupancy-sensitive, not warp-starved)
 ```
 
-It's currently **latency/barrier-bound** (a diagnostic that halves *all* weight bytes speeds it up only
-1.23×, not 2× — 76% of bandwidth sits idle). The remaining headroom (24% → ~78% MBU, HazyResearch-class)
-needs a **barrier-free producer-consumer redesign** (no `grid.sync`, per-tile flag deps, memory/compute
-overlap) — the next big build.
+It's **latency/barrier-bound** (a diagnostic that halves *all* weight bytes speeds it up only 1.23×, not
+2× — 76% of bandwidth sits idle; removing the barriers entirely would give ~404 tok/s). The obvious lever
+— a **barrier-free producer-consumer redesign** (no `grid.sync`, per-tile flag deps, overlap the weight
+streams) — was **built and measured (`kernels/pc_mlp.cu`), and it's a dead end at B=1**: 1.34× *slower*
+than the sequential barrier version, MBU *lower* not higher. Splitting warps starves each phase; the
+reduction dependency (`down` needs every k-tile) leaves almost no overlap window; and fence+flag-poll sync
+costs more than the `grid.sync` it replaces. **The barrier is cheaper than any way of removing it.** So
+~284 is the single-pass B=1 ceiling — the multiplier has to come from the algorithm, not the kernel.
 
 ## The path to ~800 tok/s (honest)
 
@@ -87,7 +91,7 @@ notes/     working notes incl. the megakernel design doc (gitignored)
 ## Honesty notes
 - Numbers are **measured end-to-end**, not projected. Microbenchmarks lie at B=1 (L2 residency, launch
   amortization) — only the token clock counts.
-- **Negative results are kept** — sparsity, tensor cores, split-K, Marlin all measured-dead at B=1. Knowing
-  *why* they fail is the point.
+- **Negative results are kept** — sparsity, tensor cores, split-K, Marlin, cp.async pipelining, and the
+  barrier-free producer-consumer megakernel are all measured-dead at B=1. Knowing *why* they fail is the point.
 - int4 adds a small perplexity cost (quantization); activation sparsity is an opt-in quality trade. Neither
   is free, and neither is claimed to be.
