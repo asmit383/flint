@@ -17,6 +17,11 @@ namespace cg = cooperative_groups;
 #else
 #define RSTEP 1
 #endif
+#ifdef NOSYNC
+#define GSYNC()      // diagnostic: no-op the grid barriers (garbage output, measures barrier cost)
+#else
+#define GSYNC() grid.sync()
+#endif
 
 __device__ __forceinline__ float wgemv_row(const uint32_t* __restrict__ Wrow,
     const __nv_bfloat16* __restrict__ srow, const __nv_bfloat16* __restrict__ x, int IN, int lane) {
@@ -56,7 +61,7 @@ __device__ void rmsnorm(cg::grid_group& grid, const __nv_bfloat16* h, const __nv
   __syncthreads();
   const float r = rms_s;
   for (int i = tid; i < DIM; i += nthreads) xn[i] = __float2bfloat16(__bfloat162float(h[i]) * r * __bfloat162float(nw[i]));
-  grid.sync();
+  GSYNC();
 }
 
 __device__ void attn_block(cg::grid_group& grid,
@@ -72,7 +77,7 @@ __device__ void attn_block(cg::grid_group& grid,
     const float r = wgemv_row(Wqkv + (size_t)row * (DIM >> 3), s_qkv + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) qkv[row] = __float2bfloat16(r);
   }
-  grid.sync();
+  GSYNC();
   const int total = NH + NKV;
   for (int hh = warp; hh < total; hh += nwarps) {
     __nv_bfloat16* base = (hh < NH) ? (qkv + hh * HD) : (qkv + DIM + (hh - NH) * HD);
@@ -82,12 +87,12 @@ __device__ void attn_block(cg::grid_group& grid,
       base[i] = __float2bfloat16(x0 * c - x1 * sn); base[i + HD / 2] = __float2bfloat16(x1 * c + x0 * sn);
     }
   }
-  grid.sync();
+  GSYNC();
   for (int i = tid; i < NKV * HD; i += nthreads) {
     kc[(size_t)pos * NKV * HD + i] = qkv[DIM + i];
     vc[(size_t)pos * NKV * HD + i] = qkv[DIM + NKV * HD + i];
   }
-  grid.sync();
+  GSYNC();
   const int T = pos + 1;
   // Phase 3a: flash partials. warp -> (head, sub); each warp handles STRIDED timesteps (sub, sub+WPH, ...)
   const int head = warp / WPH, sub = warp % WPH;
@@ -111,7 +116,7 @@ __device__ void attn_block(cg::grid_group& grid,
     if (lane == 0) { pm[pidx] = mmax; pd[pidx] = denom; }        // UNnormalized partial (flash)
     pacc[(size_t)pidx * HD + lane] = outv[0]; pacc[(size_t)pidx * HD + lane + 32] = outv[1];
   }
-  grid.sync();
+  GSYNC();
   // Phase 3b: merge WPH partials per head (flash softmax merge)
   for (int qh = warp; qh < NH; qh += nwarps) {
     float gm = -1e30f;
@@ -124,12 +129,12 @@ __device__ void attn_block(cg::grid_group& grid,
     }
     ao[qh * HD + lane] = __float2bfloat16(acc0 / gd); ao[qh * HD + lane + 32] = __float2bfloat16(acc1 / gd);
   }
-  grid.sync();
+  GSYNC();
   for (int row = warp; row < DIM; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wo + (size_t)row * (DIM >> 3), s_o + (size_t)row * (DIM >> 7), ao, DIM, lane);
     if (lane == 0) h[row] = __float2bfloat16(__bfloat162float(h[row]) + r * resid);
   }
-  grid.sync();
+  GSYNC();
 }
 
 __device__ void mlp_block(cg::grid_group& grid,
@@ -143,17 +148,17 @@ __device__ void mlp_block(cg::grid_group& grid,
     const float r = wgemv_row(Wgu + (size_t)row * (DIM >> 3), s_gu + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) gu[row] = __float2bfloat16(r);
   }
-  grid.sync();
+  GSYNC();
   for (int i = tid; i < INTER; i += nthreads) {
     const float g = __bfloat162float(gu[i]);
     act[i] = __float2bfloat16((g / (1.0f + __expf(-g))) * __bfloat162float(gu[i + INTER]));
   }
-  grid.sync();
+  GSYNC();
   for (int row = warp; row < DIM; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wd + (size_t)row * (INTER >> 3), s_d + (size_t)row * (INTER >> 7), act, INTER, lane);
     if (lane == 0) h[row] = __float2bfloat16(__bfloat162float(h[row]) + r * resid);
   }
-  grid.sync();
+  GSYNC();
 }
 
 __global__ void decode_mega(
