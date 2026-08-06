@@ -71,13 +71,19 @@ if __name__ == "__main__":
 
     Wcol, scale_col, q, scale = quant_pack_col(W, G)
     # masked dense reference
-    hm = torch.where(h.abs() > thr, h, torch.zeros_like(h)).float()
-    Wdq = (q * scale.repeat_interleave(G, dim=1)).float()      # [OUT,IN] dequantized
+    hf = h.float()
+    hm = torch.where(hf.abs() > thr, hf, torch.zeros_like(hf))   # float mask, matches kernel's float compare
+    scale_b = scale.to(torch.bfloat16).float()                 # match kernel's bf16 scales
+    Wdq = (q * scale_b.repeat_interleave(G, dim=1)).float()     # [OUT,IN] dequantized
     y_ref = (Wdq @ hm)
 
     y = m.int4_spmv(Wcol, scale_col, h, thr, OUT, a.jsplit[0]).float()
     rel = (y - y_ref).norm().item() / (y_ref.norm().item() + 1e-9)
-    print(f"correctness rel-L2 {rel:.4f}  {'OK' if rel < 0.02 else 'BAD'}")
+    cos = torch.nn.functional.cosine_similarity(y, y_ref, dim=0).item()
+    print(f"correctness rel-L2 {rel:.4f}  cos {cos:.5f}  {'OK' if rel < 0.02 else 'BAD'}")
+    print(f"  y[:4]  ={y[:4].tolist()}")
+    print(f"  ref[:4]={y_ref[:4].tolist()}")
+    print(f"  ratio  ={(y[:4]/y_ref[:4]).tolist()}")
 
     # dense champion time on the same shape (reads ALL bytes)
     Wq, scales = quant_pack_row(W, G)

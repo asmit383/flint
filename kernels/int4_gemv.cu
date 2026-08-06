@@ -502,7 +502,7 @@ __global__ void int4_spmv_kernel(
   float sc[8];
   for (int j = j0; j < j1; j++) {
     const float hj = __bfloat162float(h[j]);
-    if (fabsf(hj) < thresh) continue;             // uniform across block -> no divergence, column skipped
+    if (fabsf(hj) <= thresh) continue;            // keep |h| > t (matches ref/frac); uniform -> no divergence
     const int g = j >> 7;
     if (g != lastg) {                             // group scales constant over 128 j -> load once per group
       #pragma unroll
