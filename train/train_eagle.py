@@ -6,9 +6,11 @@ token the predicted feature implies. Draft is ~1/40th the target's depth -> chea
 
     python train/train_eagle.py --data /root/eagle_data --epochs 3 --out /root/eagle_data/draft.pt
 """
-import argparse, glob, os, math, torch
+import argparse, glob, os, sys, math, torch
 import torch.nn as nn
 import torch.nn.functional as F
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from draft_model import DraftHead, rmsnorm
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--data", default="/root/eagle_data")
@@ -26,33 +28,6 @@ dim, vocab, nh, lsc = H["dim"], H["vocab"], H["n_heads"], H["logits_scaling"]
 embed = H["embed"].to(dev)                                  # [vocab, dim] frozen
 lm_head = H["lm_head"].to(dev)                              # [vocab, dim] frozen (tied)
 norm_w = H["norm"]["weight"].to(dev)                        # RMSNorm weight, frozen
-
-def rmsnorm(x, w, eps=1e-5):
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
-
-class DraftHead(nn.Module):
-    def __init__(self, dim, nh, inter):
-        super().__init__()
-        self.nh = nh
-        self.merge = nn.Linear(2 * dim, dim, bias=False)
-        self.n1 = nn.Parameter(torch.ones(dim))
-        self.q = nn.Linear(dim, dim, bias=False); self.k = nn.Linear(dim, dim, bias=False)
-        self.v = nn.Linear(dim, dim, bias=False); self.o = nn.Linear(dim, dim, bias=False)
-        self.n2 = nn.Parameter(torch.ones(dim))
-        self.gate = nn.Linear(dim, inter, bias=False); self.up = nn.Linear(dim, inter, bias=False)
-        self.down = nn.Linear(inter, dim, bias=False)
-    def forward(self, feat, emb):                          # feat,emb: [B,T,dim]
-        B, T, D = feat.shape
-        x = self.merge(torch.cat([feat, emb], -1))
-        h = rmsnorm(x, self.n1)
-        q = self.q(h).view(B, T, self.nh, D // self.nh).transpose(1, 2)
-        k = self.k(h).view(B, T, self.nh, D // self.nh).transpose(1, 2)
-        v = self.v(h).view(B, T, self.nh, D // self.nh).transpose(1, 2)
-        att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.o(att.transpose(1, 2).reshape(B, T, D))
-        h = rmsnorm(x, self.n2)
-        x = x + self.down(F.silu(self.gate(h)) * self.up(h))
-        return x                                           # predicted next feature
 
 draft = DraftHead(dim, nh, a.inter).to(dev).to(torch.bfloat16)
 nparam = sum(p.numel() for p in draft.parameters())

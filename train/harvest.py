@@ -26,10 +26,21 @@ model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16
 dim = model.config.hidden_size
 print(f"model={a.model} dim={dim} | harvesting {a.seqs} x {a.ctx}-tok seqs -> {a.out}")
 
-# WikiText-2 TRAIN (disjoint from the test set we eval ppl on)
-pq = hf_hub_download(repo_id="Salesforce/wikitext", repo_type="dataset",
-                     filename="wikitext-2-raw-v1/train-00000-of-00001.parquet")
-text = "\n\n".join(t for t in pd.read_parquet(pq)["text"].tolist() if t.strip())
+# WikiText-103 TRAIN (~100M tokens; far more than wt-2 for a real draft)
+parts = []
+for fn in ["wikitext-103-raw-v1/train-00000-of-00002.parquet",
+           "wikitext-103-raw-v1/train-00001-of-00002.parquet"]:
+    try:
+        pq = hf_hub_download(repo_id="Salesforce/wikitext", repo_type="dataset", filename=fn)
+        parts.append(pd.read_parquet(pq))
+    except Exception as e:
+        print(f"  skip {fn}: {e}")
+if not parts:                                              # fallback to wt-2
+    pq = hf_hub_download(repo_id="Salesforce/wikitext", repo_type="dataset",
+                         filename="wikitext-2-raw-v1/train-00000-of-00001.parquet")
+    parts = [pd.read_parquet(pq)]
+df = pd.concat(parts, ignore_index=True)
+text = "\n\n".join(t for t in df["text"].tolist() if t.strip())
 ids = tok(text, return_tensors="pt").input_ids[0]
 nseq = min(a.seqs, ids.shape[0] // a.ctx)
 ids = ids[:nseq * a.ctx].view(nseq, a.ctx)

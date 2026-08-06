@@ -6,10 +6,12 @@ spec-decode => accepted iff == greedy. Reports tokens/pass and projected tok/s v
 
     python train/eagle_accept.py --data /root/eagle_data --draft /root/eagle_data/draft.pt
 """
-import argparse, os, torch
+import argparse, os, sys, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from draft_model import DraftHead, rmsnorm
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="ibm-granite/granite-4.1-3b")
@@ -26,29 +28,6 @@ model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16
 H = torch.load(os.path.join(a.data, "heads.pt"), map_location="cpu")
 dim, vocab, lsc = H["dim"], H["vocab"], H["logits_scaling"]
 embed = H["embed"].to(dev); lm_head = H["lm_head"].to(dev); norm_w = H["norm"]["weight"].to(dev)
-
-def rmsnorm(x, w, eps=1e-5):
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
-
-class DraftHead(nn.Module):
-    def __init__(self, dim, nh, inter):
-        super().__init__(); self.nh = nh
-        self.merge = nn.Linear(2 * dim, dim, bias=False)
-        self.n1 = nn.Parameter(torch.ones(dim)); self.n2 = nn.Parameter(torch.ones(dim))
-        self.q = nn.Linear(dim, dim, bias=False); self.k = nn.Linear(dim, dim, bias=False)
-        self.v = nn.Linear(dim, dim, bias=False); self.o = nn.Linear(dim, dim, bias=False)
-        self.gate = nn.Linear(dim, inter, bias=False); self.up = nn.Linear(dim, inter, bias=False)
-        self.down = nn.Linear(inter, dim, bias=False)
-    def forward(self, feat, emb):
-        B, T, D = feat.shape
-        x = self.merge(torch.cat([feat, emb], -1)); h = rmsnorm(x, self.n1)
-        q = self.q(h).view(B, T, self.nh, D // self.nh).transpose(1, 2)
-        k = self.k(h).view(B, T, self.nh, D // self.nh).transpose(1, 2)
-        v = self.v(h).view(B, T, self.nh, D // self.nh).transpose(1, 2)
-        att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.o(att.transpose(1, 2).reshape(B, T, D))
-        h = rmsnorm(x, self.n2)
-        return x + self.down(F.silu(self.gate(h)) * self.up(h))
 
 ck = torch.load(a.draft, map_location="cpu")
 draft = DraftHead(ck["dim"], ck["nh"], ck["inter"]).to(dev).to(torch.bfloat16)
@@ -76,7 +55,8 @@ def roll(feats, tokens, i, K, W=64):                         # autoregressive dr
     out = []
     for _ in range(K):
         emb = F.embedding(tnext, embed).to(torch.bfloat16)
-        fp = draft(fseq.unsqueeze(0), emb.unsqueeze(0))[0]   # [w,dim]; last pos predicts the next feature
+        pos = torch.arange(lo, lo + fseq.shape[0], device=dev)   # absolute positions for RoPE
+        fp = draft(fseq.unsqueeze(0), emb.unsqueeze(0), pos)[0]  # [w,dim]; last pos predicts next feature
         f_new = fp[-1]
         t_new = head_tok(f_new.view(1, 1, -1))[0, 0]
         out.append(t_new.item())
