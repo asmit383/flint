@@ -477,6 +477,64 @@ __global__ void int4_gemv_fd_kernel(
   if (lane == 0) y[row] = __float2bfloat16(sum);
 }
 
+// Activation-sparse int4 GEMV (down_proj): y = W[OUT,IN] @ h[IN], h ~50% sparse. To turn sparse h into
+// FEWER BYTES READ, weights are COLUMN-major (W_col[IN, OUT/8]: input j's OUT weights contiguous). The
+// kernel iterates input columns and skips j where |h[j]| < t — a UNIFORM branch (same j for all threads
+// in the block) so no warp divergence, and the whole weight column is simply never loaded. j-split over
+// blockIdx.y for parallelism (OUT=2560 alone underfills); partials atomicAdd into a float accumulator.
+__global__ void int4_spmv_kernel(
+    const uint32_t* __restrict__ Wcol,          // [IN, OUT/8]
+    const __nv_bfloat16* __restrict__ scale_col,// [IN/128, OUT]
+    const __nv_bfloat16* __restrict__ h,        // [IN]
+    float thresh, float* __restrict__ yf,
+    int IN, int OUT, int jspan) {
+  const int OW = OUT >> 3;                        // output words (8 outputs each)
+  const int owl = blockIdx.x * blockDim.x + threadIdx.x;
+  if (owl >= OW) return;
+  const int j0 = blockIdx.y * jspan;
+  const int j1 = min(j0 + jspan, IN);
+
+  float acc[8];
+  #pragma unroll
+  for (int m = 0; m < 8; m++) acc[m] = 0.f;
+
+  int lastg = -1;
+  float sc[8];
+  for (int j = j0; j < j1; j++) {
+    const float hj = __bfloat162float(h[j]);
+    if (fabsf(hj) < thresh) continue;             // uniform across block -> no divergence, column skipped
+    const int g = j >> 7;
+    if (g != lastg) {                             // group scales constant over 128 j -> load once per group
+      #pragma unroll
+      for (int m = 0; m < 8; m++) sc[m] = __bfloat162float(scale_col[(size_t)g * OUT + owl * 8 + m]);
+      lastg = g;
+    }
+    const uint32_t w = Wcol[(size_t)j * OW + owl]; // coalesced across threads (consecutive owl)
+    #pragma unroll
+    for (int m = 0; m < 8; m++)
+      acc[m] += hj * (float((w >> (4 * m)) & 0xF) - 8.0f) * sc[m];
+  }
+  #pragma unroll
+  for (int m = 0; m < 8; m++) atomicAdd(&yf[owl * 8 + m], acc[m]);
+}
+
+torch::Tensor int4_spmv(torch::Tensor Wcol, torch::Tensor scale_col, torch::Tensor h,
+                        double thresh, int64_t OUT, int64_t jsplit) {
+  const int IN = Wcol.size(0);
+  auto yf = torch::zeros({OUT}, h.options().dtype(torch::kFloat32));
+  const uint32_t* wc = reinterpret_cast<const uint32_t*>(Wcol.data_ptr<int32_t>());
+  const __nv_bfloat16* scc = reinterpret_cast<const __nv_bfloat16*>(scale_col.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* hp = reinterpret_cast<const __nv_bfloat16*>(h.data_ptr<at::BFloat16>());
+  float* yp = yf.data_ptr<float>();
+  const int OW = OUT >> 3;
+  const int nthreads = 256;
+  const int jspan = (IN + jsplit - 1) / jsplit;
+  dim3 grid((OW + nthreads - 1) / nthreads, jsplit);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int4_spmv_kernel<<<grid, nthreads, 0, stream>>>(wc, scc, hp, (float)thresh, yp, IN, OUT, jspan);
+  return yf.to(torch::kBFloat16);
+}
+
 torch::Tensor int4_gemv_fd(torch::Tensor Wq, torch::Tensor scales, torch::Tensor x, int64_t nacc) {
   const int OUT = Wq.size(0);
   const int ncols = Wq.size(1);
@@ -578,4 +636,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int4_gemv_ws", &int4_gemv_ws, "int4 weight-only GEMV, warp-split intra-block (B=1)");
   m.def("int4_gemv_v", &int4_gemv_v, "int4 weight-only GEMV, contiguous + 128-bit vector x-load (B=1)");
   m.def("int4_gemv_fd", &int4_gemv_fd, "int4 weight-only GEMV, fast bf16x2 dequant (B=1)");
+  m.def("int4_spmv", &int4_spmv, "activation-sparse int4 GEMV, column-major skip (B=1)");
 }
