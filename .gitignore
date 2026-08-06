@@ -27,3 +27,4 @@ build/
 # claude
 .claude/
 CLAUDE.md
+phases.md
