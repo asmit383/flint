@@ -12,6 +12,11 @@ namespace cg = cooperative_groups;
 #define HD 64
 #define NH 40
 #define NKV 8
+#ifdef HALFBYTES
+#define RSTEP 2      // diagnostic: skip every other GEMV row -> read ~half the weight bytes
+#else
+#define RSTEP 1
+#endif
 
 __device__ __forceinline__ float wgemv_row(const uint32_t* __restrict__ Wrow,
     const __nv_bfloat16* __restrict__ srow, const __nv_bfloat16* __restrict__ x, int IN, int lane) {
@@ -62,7 +67,7 @@ __device__ void attn_block(cg::grid_group& grid,
     int tid, int nthreads, int warp, int lane, int nwarps) {
   const int QKV = DIM + 2 * NKV * HD;
   rmsnorm(grid, h, nw, xn, red, DIM, tid, nthreads);
-  for (int row = warp; row < QKV; row += nwarps) {
+  for (int row = warp; row < QKV; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wqkv + (size_t)row * (DIM >> 3), s_qkv + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) qkv[row] = __float2bfloat16(r);
   }
@@ -103,7 +108,7 @@ __device__ void attn_block(cg::grid_group& grid,
     for (int j = 0; j < 2; j++) ao[qh * HD + lane + j * 32] = __float2bfloat16(outv[j] / denom);
   }
   grid.sync();
-  for (int row = warp; row < DIM; row += nwarps) {
+  for (int row = warp; row < DIM; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wo + (size_t)row * (DIM >> 3), s_o + (size_t)row * (DIM >> 7), ao, DIM, lane);
     if (lane == 0) h[row] = __float2bfloat16(__bfloat162float(h[row]) + r * resid);
   }
@@ -117,7 +122,7 @@ __device__ void mlp_block(cg::grid_group& grid,
     int DIM, int INTER, float resid, int tid, int nthreads, int warp, int lane, int nwarps) {
   const int INTER2 = 2 * INTER;
   rmsnorm(grid, h, nw, xn, red, DIM, tid, nthreads);
-  for (int row = warp; row < INTER2; row += nwarps) {
+  for (int row = warp; row < INTER2; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wgu + (size_t)row * (DIM >> 3), s_gu + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) gu[row] = __float2bfloat16(r);
   }
@@ -127,7 +132,7 @@ __device__ void mlp_block(cg::grid_group& grid,
     act[i] = __float2bfloat16((g / (1.0f + __expf(-g))) * __bfloat162float(gu[i + INTER]));
   }
   grid.sync();
-  for (int row = warp; row < DIM; row += nwarps) {
+  for (int row = warp; row < DIM; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wd + (size_t)row * (INTER >> 3), s_d + (size_t)row * (INTER >> 7), act, INTER, lane);
     if (lane == 0) h[row] = __float2bfloat16(__bfloat162float(h[row]) + r * resid);
   }
@@ -162,7 +167,7 @@ __global__ void decode_mega(
   }
   // final norm + LM head
   rmsnorm(grid, h, nf, xn, red, DIM, tid, nthreads);
-  for (int row = warp; row < VOCAB; row += nwarps) {
+  for (int row = warp; row < VOCAB; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wlm + (size_t)row * (DIM >> 3), s_lm + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) logits[row] = r / logits_scaling;
   }
