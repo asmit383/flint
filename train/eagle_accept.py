@@ -43,8 +43,10 @@ def t_for(M):
     return T_M[16]
 
 PROMPTS = {
-    "code":  "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n",
+    "wiki1": "The city was founded in the early nineteenth century and grew rapidly during the industrial",
+    "wiki2": "In biology, the process of cellular respiration converts glucose and oxygen into energy that",
     "prose": "The history of the Roman Empire is a subject that has fascinated scholars for centuries.",
+    "code":  "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n",
 }
 
 @torch.no_grad()
