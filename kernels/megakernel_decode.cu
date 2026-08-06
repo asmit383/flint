@@ -159,18 +159,24 @@ __global__ void decode_mega(
   const size_t kc_st = (size_t)MAXSEQ * NKV * HD;
 
   for (int l = 0; l < NL; l++) {
+#ifndef NOATTN
     attn_block(grid, Wqkv + l * qkv_st, s_qkv + l * sqkv_st, Wo + l * wo_st, s_o + l * so_st,
                n1 + (size_t)l * DIM, h, kc + l * kc_st, vc + l * kc_st, xn, qkv, ao, red,
                DIM, pos, scale, rope_base, resid, tid, nthreads, warp, lane, nwarps);
+#endif
+#ifndef NOMLP
     mlp_block(grid, n2 + (size_t)l * DIM, Wgu + l * wgu_st, s_gu + l * sgu_st, Wd + l * wd_st, s_d + l * sd_st,
               h, xn, gu, act, red, DIM, INTER, resid, tid, nthreads, warp, lane, nwarps);
+#endif
   }
   // final norm + LM head
   rmsnorm(grid, h, nf, xn, red, DIM, tid, nthreads);
+#ifndef NOLM
   for (int row = warp; row < VOCAB; row += RSTEP * nwarps) {
     const float r = wgemv_row(Wlm + (size_t)row * (DIM >> 3), s_lm + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) logits[row] = r / logits_scaling;
   }
+#endif
 }
 
 torch::Tensor decode_mega_launch(
