@@ -94,14 +94,14 @@ if __name__ == "__main__":
             mbu = 100 * gbs * 1e9 / a.peak_bw
             if rel < 0.02 and (best is None or mbu > best[1]): best = (f"glob nacc={nacc}", mbu)
             print(f"    glob nacc={nacc}   {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
-        # split-K sweep (helps tall-K/few-row shapes that underfill: down)
+        # global-x + split-K sweep (multiplies block count to fill SMs on few-row shapes: down)
         nblk = IN // 256
         for sk in [s for s in (2, 4, 8, 16) if nblk % s == 0]:
-            ysk = m.int4_gemv_sk(Wq, scales, x.view(IN), sk, 4).float()
+            ysk = m.int4_gemv_gsk(Wq, scales, x.view(IN), sk, 4).float()
             rel = (ysk - y_ref).norm().item() / (y_ref.norm().item() + 1e-9)
-            ms = graph_time(lambda: m.int4_gemv_sk(Wq, scales, x.view(IN), sk, 4), a.iters)
+            ms = graph_time(lambda: m.int4_gemv_gsk(Wq, scales, x.view(IN), sk, 4), a.iters)
             gbs = int4_bytes(OUT, IN) / (ms * 1e-3) / 1e9
             mbu = 100 * gbs * 1e9 / a.peak_bw
-            if rel < 0.02 and (best is None or mbu > best[1]): best = (f"splitk={sk}", mbu)
-            print(f"    splitk={sk} nacc4  {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
+            if rel < 0.02 and (best is None or mbu > best[1]): best = (f"gsk={sk}", mbu)
+            print(f"    gsk={sk} nacc4     {ms*1e3:7.2f} us  {gbs:7.1f} GB/s  MBU {mbu:5.1f}%  (rel {rel:.4f})")
         print(f"    best: {best[0]}  MBU {best[1]:.1f}%   (tinygemm ref: gate/up 37%, down 45%, q/o 19%)")

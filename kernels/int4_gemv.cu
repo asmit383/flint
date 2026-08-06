@@ -215,6 +215,82 @@ __global__ void int4_gemv_g_kernel(
   if (lane == 0) y[row] = __float2bfloat16(sum);
 }
 
+// Global-x + split-K: the two P1/P2 wins together. No shared (high per-block occupancy) AND blockIdx.y
+// splits K so the block COUNT multiplies -> fills the SMs on few-row shapes (down launches only 320
+// blocks otherwise, ~2.4/SM). Partials atomicAdd into a float accumulator.
+template<int NACC>
+__global__ void int4_gemv_gsk_kernel(
+    const uint32_t* __restrict__ Wq,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ yf,
+    int IN, int OUT, int nblk_per_split) {
+  const int tid = threadIdx.x, nthreads = blockDim.x;
+  const int lane = tid & 31;
+  const int row  = blockIdx.x * (nthreads >> 5) + (tid >> 5);
+  if (row >= OUT) return;
+  const int nblk = IN >> 8;
+  const int blk0 = blockIdx.y * nblk_per_split;
+  const uint32_t* __restrict__ Wrow = Wq + (size_t)row * (nblk * 32);
+  const __nv_bfloat16* __restrict__ srow = scales + (size_t)row * (nblk * 2);
+
+  float acc[NACC];
+  #pragma unroll
+  for (int a = 0; a < NACC; a++) acc[a] = 0.f;
+
+  for (int b = blk0; b < blk0 + nblk_per_split; b += NACC) {
+    #pragma unroll
+    for (int a = 0; a < NACC; a++) {
+      const int blk = b + a;
+      if (blk < blk0 + nblk_per_split) {
+        const uint32_t w = Wrow[blk * 32 + lane];
+        const int base = (blk << 8) + lane;
+        float xv[8];
+        #pragma unroll
+        for (int m = 0; m < 8; m++) xv[m] = __bfloat162float(__ldg(&x[base + (m << 5)]));
+        const float sc_lo = __bfloat162float(srow[2 * blk]);
+        const float sc_hi = __bfloat162float(srow[2 * blk + 1]);
+        float plo = 0.f, phi = 0.f;
+        #pragma unroll
+        for (int m = 0; m < 4; m++) plo += (float((w >> (4 * m)) & 0xF) - 8.0f) * xv[m];
+        #pragma unroll
+        for (int m = 4; m < 8; m++) phi += (float((w >> (4 * m)) & 0xF) - 8.0f) * xv[m];
+        acc[a] += sc_lo * plo + sc_hi * phi;
+      }
+    }
+  }
+  float sum = 0.f;
+  #pragma unroll
+  for (int a = 0; a < NACC; a++) sum += acc[a];
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+  if (lane == 0) atomicAdd(&yf[row], sum);
+}
+
+torch::Tensor int4_gemv_gsk(torch::Tensor Wq, torch::Tensor scales, torch::Tensor x,
+                            int64_t splitk, int64_t nacc) {
+  const int OUT = Wq.size(0);
+  const int nblk = Wq.size(1) / 32;
+  const int IN = nblk * 256;
+  TORCH_CHECK(nblk % splitk == 0, "splitk must divide nblk (", nblk, ")");
+  auto yf = torch::zeros({OUT}, x.options().dtype(torch::kFloat32));
+  const uint32_t* wq = reinterpret_cast<const uint32_t*>(Wq.data_ptr<int32_t>());
+  const __nv_bfloat16* sc = reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
+  float* yp = yf.data_ptr<float>();
+  const int nthreads = 256;
+  dim3 grid((OUT + (nthreads >> 5) - 1) / (nthreads >> 5), splitk);
+  const int nbps = nblk / splitk;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  switch (nacc) {
+    case 2: int4_gemv_gsk_kernel<2><<<grid, nthreads, 0, stream>>>(wq, sc, xp, yp, IN, OUT, nbps); break;
+    case 4: int4_gemv_gsk_kernel<4><<<grid, nthreads, 0, stream>>>(wq, sc, xp, yp, IN, OUT, nbps); break;
+    case 8: int4_gemv_gsk_kernel<8><<<grid, nthreads, 0, stream>>>(wq, sc, xp, yp, IN, OUT, nbps); break;
+    default: TORCH_CHECK(false, "nacc must be 2/4/8");
+  }
+  return yf.to(torch::kBFloat16);
+}
+
 torch::Tensor int4_gemv_g(torch::Tensor Wq, torch::Tensor scales, torch::Tensor x, int64_t nacc) {
   const int OUT = Wq.size(0);
   const int nblk = Wq.size(1) / 32;
@@ -268,4 +344,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int4_gemv", &int4_gemv, "int4 weight-only GEMV (B=1)");
   m.def("int4_gemv_g", &int4_gemv_g, "int4 weight-only GEMV, x from global/L2 (B=1)");
   m.def("int4_gemv_sk", &int4_gemv_sk, "int4 weight-only GEMV, split-K (B=1)");
+  m.def("int4_gemv_gsk", &int4_gemv_gsk, "int4 weight-only GEMV, global-x + split-K (B=1)");
 }
