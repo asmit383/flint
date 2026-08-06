@@ -18,6 +18,7 @@ ap.add_argument("--epochs", type=int, default=3)
 ap.add_argument("--bs", type=int, default=4)
 ap.add_argument("--lr", type=float, default=3e-4)
 ap.add_argument("--feat-w", type=float, default=0.1)
+ap.add_argument("--wd", type=float, default=0.0)
 ap.add_argument("--inter", type=int, default=4096)
 ap.add_argument("--out", default="/root/eagle_data/draft.pt")
 a = ap.parse_args()
@@ -39,7 +40,7 @@ ids = torch.cat([d["ids"] for d in data]); feat = torch.cat([d["feat"] for d in 
 N, ctx = ids.shape
 print(f"data: {N} seqs x {ctx} tok")
 
-opt = torch.optim.AdamW(draft.parameters(), lr=a.lr, weight_decay=0.0)
+opt = torch.optim.AdamW(draft.parameters(), lr=a.lr, weight_decay=a.wd)
 steps = (N // a.bs) * a.epochs
 sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=steps, pct_start=0.05)
 
