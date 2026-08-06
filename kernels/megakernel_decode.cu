@@ -38,57 +38,6 @@ __device__ __forceinline__ float wgemv_row(const uint32_t* __restrict__ Wrow,
   return acc;
 }
 
-// block-local rmsnorm scalar (redundant per block, __syncthreads only — no grid barrier)
-__device__ __forceinline__ float block_rms(const __nv_bfloat16* h, int DIM) {
-  float ss = 0.f;
-  for (int i = threadIdx.x; i < DIM; i += blockDim.x) { float v = __bfloat162float(h[i]); ss += v * v; }
-  __shared__ float bs[32]; __shared__ float rms_s;
-  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nwb = blockDim.x >> 5;
-  #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
-  if (lane == 0) bs[w] = ss;
-  __syncthreads();
-  if (w == 0) { float s = (lane < nwb) ? bs[lane] : 0.f;
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-    if (lane == 0) rms_s = rsqrtf(s / DIM + 1e-5f); }
-  __syncthreads();
-  return rms_s;
-}
-
-// GEMV with rmsnorm FUSED inline: x[k] = h[k]*rms*nw[k], computed on the fly (no xn buffer, no barrier)
-__device__ __forceinline__ float wgemv_rms(const uint32_t* __restrict__ Wrow, const __nv_bfloat16* __restrict__ srow,
-    const __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ nw, float rms, int IN, int lane) {
-  const int ncols = IN >> 3; float acc = 0.f;
-  for (int col = lane; col < ncols; col += 32) {
-    const uint32_t w = Wrow[col]; const float sc = __bfloat162float(srow[col >> 4]); const int k0 = col << 3;
-    const int4 hr = __ldg(reinterpret_cast<const int4*>(&h[k0])), nr = __ldg(reinterpret_cast<const int4*>(&nw[k0]));
-    const __nv_bfloat16 *hb = reinterpret_cast<const __nv_bfloat16*>(&hr), *nb = reinterpret_cast<const __nv_bfloat16*>(&nr);
-    #pragma unroll
-    for (int m = 0; m < 8; m++) acc += (float((w >> (4 * m)) & 0xF) - 8.0f) * sc * (__bfloat162float(hb[m]) * rms * __bfloat162float(nb[m]));
-  }
-  #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-  return acc;
-}
-
-// down GEMV with SiLU FUSED inline: act[k] = silu(gu[k])*gu[k+INTER], computed on the fly (no act buffer, no barrier)
-__device__ __forceinline__ float wgemv_silu(const uint32_t* __restrict__ Wrow, const __nv_bfloat16* __restrict__ srow,
-    const __nv_bfloat16* __restrict__ gu, int INTER, int lane) {
-  const int ncols = INTER >> 3; float acc = 0.f;
-  for (int col = lane; col < ncols; col += 32) {
-    const uint32_t w = Wrow[col]; const float sc = __bfloat162float(srow[col >> 4]); const int k0 = col << 3;
-    const int4 gr = __ldg(reinterpret_cast<const int4*>(&gu[k0])), ur = __ldg(reinterpret_cast<const int4*>(&gu[INTER + k0]));
-    const __nv_bfloat16 *gb = reinterpret_cast<const __nv_bfloat16*>(&gr), *ub = reinterpret_cast<const __nv_bfloat16*>(&ur);
-    #pragma unroll
-    for (int m = 0; m < 8; m++) { const float g = __bfloat162float(gb[m]); const float a = (g / (1.0f + __expf(-g))) * __bfloat162float(ub[m]);
-      acc += (float((w >> (4 * m)) & 0xF) - 8.0f) * sc * a; }
-  }
-  #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-  return acc;
-}
-
 // rmsnorm(h) -> xn.  REDUNDANT per-block reduction: each block sums-of-squares over ALL of h locally
 // (h is tiny + L2-hot), reduced with a cheap __syncthreads (block barrier), NOT a grid barrier. Then
 // each block normalizes its grid-partitioned slice. 3 grid.sync() -> 1. (Assumes h is ready, i.e. the
@@ -123,9 +72,9 @@ __device__ void attn_block(cg::grid_group& grid,
     int DIM, int pos, float scale, float rope_base, float resid,
     int tid, int nthreads, int warp, int lane, int nwarps) {
   const int QKV = DIM + 2 * NKV * HD;
-  const float rms1 = block_rms(h, DIM);                  // rmsnorm fused into the qkv GEMV -> no separate barrier
+  rmsnorm(grid, h, nw, xn, red, DIM, tid, nthreads);
   for (int row = warp; row < QKV; row += RSTEP * nwarps) {
-    const float r = wgemv_rms(Wqkv + (size_t)row * (DIM >> 3), s_qkv + (size_t)row * (DIM >> 7), h, nw, rms1, DIM, lane);
+    const float r = wgemv_row(Wqkv + (size_t)row * (DIM >> 3), s_qkv + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) qkv[row] = __float2bfloat16(r);
   }
   GSYNC();
@@ -194,14 +143,19 @@ __device__ void mlp_block(cg::grid_group& grid,
     __nv_bfloat16* xn, __nv_bfloat16* gu, __nv_bfloat16* act, float* red,
     int DIM, int INTER, float resid, int tid, int nthreads, int warp, int lane, int nwarps) {
   const int INTER2 = 2 * INTER;
-  const float rms2 = block_rms(h, DIM);                  // rmsnorm fused into the gate/up GEMV
+  rmsnorm(grid, h, nw, xn, red, DIM, tid, nthreads);
   for (int row = warp; row < INTER2; row += RSTEP * nwarps) {
-    const float r = wgemv_rms(Wgu + (size_t)row * (DIM >> 3), s_gu + (size_t)row * (DIM >> 7), h, nw, rms2, DIM, lane);
+    const float r = wgemv_row(Wgu + (size_t)row * (DIM >> 3), s_gu + (size_t)row * (DIM >> 7), xn, DIM, lane);
     if (lane == 0) gu[row] = __float2bfloat16(r);
   }
   GSYNC();
-  for (int row = warp; row < DIM; row += RSTEP * nwarps) {   // SiLU fused into down GEMV -> no separate silu barrier
-    const float r = wgemv_silu(Wd + (size_t)row * (INTER >> 3), s_d + (size_t)row * (INTER >> 7), gu, INTER, lane);
+  for (int i = tid; i < INTER; i += nthreads) {
+    const float g = __bfloat162float(gu[i]);
+    act[i] = __float2bfloat16((g / (1.0f + __expf(-g))) * __bfloat162float(gu[i + INTER]));
+  }
+  GSYNC();
+  for (int row = warp; row < DIM; row += RSTEP * nwarps) {
+    const float r = wgemv_row(Wd + (size_t)row * (INTER >> 3), s_d + (size_t)row * (INTER >> 7), act, INTER, lane);
     if (lane == 0) h[row] = __float2bfloat16(__bfloat162float(h[row]) + r * resid);
   }
   GSYNC();
