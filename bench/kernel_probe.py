@@ -44,13 +44,25 @@ def bench_one(name, out_f, in_f, peak, iters, dev):
     lin = make_int4_linear(out_f, in_f, dev)
     x = torch.randn(1, in_f, device=dev, dtype=torch.bfloat16)
     with torch.no_grad():
-        for _ in range(30):                      # warmup
+        # CUDA-graph capture: eager launch overhead (~37us) dwarfs a B=1 GEMV and would mask the
+        # kernel's real bandwidth. Graph replay is what the actual decode loop uses, so it's the
+        # honest per-kernel time.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(5):
+                y = lin(x)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
             y = lin(x)
+        for _ in range(30):                      # warmup replays
+            g.replay()
         torch.cuda.synchronize()
         s, e = torch.cuda.Event(True), torch.cuda.Event(True)
         s.record()
         for _ in range(iters):
-            y = lin(x)
+            g.replay()
         e.record(); torch.cuda.synchronize()
     ms = s.elapsed_time(e) / iters
     gbs = int4_bytes(out_f, in_f) / (ms * 1e-3) / 1e9
