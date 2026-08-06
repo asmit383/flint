@@ -26,28 +26,28 @@ __device__ __forceinline__ float wgemv_row(const uint32_t* __restrict__ Wrow,
   return acc;
 }
 
-// rmsnorm(h) -> xn.  Block-level reduction (shared) then ONE atomicAdd per block -> ~256x less atomic
-// contention than the naive per-thread atomicAdd (the megakernel's serialization killer).
+// rmsnorm(h) -> xn.  REDUNDANT per-block reduction: each block sums-of-squares over ALL of h locally
+// (h is tiny + L2-hot), reduced with a cheap __syncthreads (block barrier), NOT a grid barrier. Then
+// each block normalizes its grid-partitioned slice. 3 grid.sync() -> 1. (Assumes h is ready, i.e. the
+// previous phase ended with a grid.sync.) This trades a little redundant math for killing ~162 barriers.
 __device__ void rmsnorm(cg::grid_group& grid, const __nv_bfloat16* h, const __nv_bfloat16* nw,
                         __nv_bfloat16* xn, float* red, int DIM, int tid, int nthreads) {
-  if (tid == 0) red[0] = 0.f;
-  grid.sync();
-  float p = 0.f;
-  for (int i = tid; i < DIM; i += nthreads) { float v = __bfloat162float(h[i]); p += v * v; }
-  __shared__ float bs[32];
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < DIM; i += blockDim.x) { float v = __bfloat162float(h[i]); ss += v * v; }
+  __shared__ float bs[32]; __shared__ float rms_s;
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw_b = blockDim.x >> 5;
   #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(0xffffffffu, p, o);
-  if (lane == 0) bs[w] = p;
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+  if (lane == 0) bs[w] = ss;
   __syncthreads();
   if (w == 0) {
     float s = (lane < nw_b) ? bs[lane] : 0.f;
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-    if (lane == 0) atomicAdd(&red[0], s);          // one atomic per block, not per thread
+    if (lane == 0) rms_s = rsqrtf(s / DIM + 1e-5f);
   }
-  grid.sync();
-  const float r = rsqrtf(red[0] / DIM + 1e-5f);
+  __syncthreads();
+  const float r = rms_s;
   for (int i = tid; i < DIM; i += nthreads) xn[i] = __float2bfloat16(__bfloat162float(h[i]) * r * __bfloat162float(nw[i]));
   grid.sync();
 }
