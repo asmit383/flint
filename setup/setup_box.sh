@@ -16,8 +16,12 @@ nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
 echo "== [2/4] venv + deps (torch + inference + quant tooling) =="
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip uv
+# torch pinned to cu128 (CUDA 12.8): matches driver >= 570. The DEFAULT 'latest' wheel is cu130
+# (CUDA 13.0) which needs driver >= 580 and fails on most current boxes ("driver too old").
+TORCH_CU="${TORCH_CU:-cu128}"
+"$VENV/bin/uv" pip install --python "$VENV/bin/python" torch --index-url "https://download.pytorch.org/whl/${TORCH_CU}"
 "$VENV/bin/uv" pip install --python "$VENV/bin/python" \
-    torch transformers datasets accelerate huggingface_hub torchao \
+    transformers datasets accelerate huggingface_hub torchao \
     tiktoken blobfile numpy pandas pyarrow sentencepiece
 "$VENV/bin/python" - <<'PY'
 import torch, torchao

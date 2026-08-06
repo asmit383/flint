@@ -25,9 +25,18 @@ nparams = sum(p.numel() for p in model.parameters())
 bytes_tok = nparams * 2
 label = "bf16"
 if a.int4:
-    # torchao int4 = same aten _weight_int4pack_mm (tinygemm) kernel gpt-fast uses, torch-2.5-matched
-    from torchao.quantization import quantize_, int4_weight_only
-    quantize_(model, int4_weight_only(group_size=128))
+    # torchao int4 = same aten _weight_int4pack_mm (tinygemm) kernel gpt-fast uses.
+    from torchao.quantization import quantize_
+    try:
+        from torchao.quantization import Int4WeightOnlyConfig   # torchao >= 0.8 (config-based)
+        # tile-packed (tensor-core tiled) = classic aten _weight_int4pack_mm tinygemm; the default
+        # PLAIN format in torchao 0.18 needs an mslk lib we don't have.
+        from torchao.quantization.quantize_.workflows.int4.int4_packing_format import Int4PackingFormat
+        cfg = Int4WeightOnlyConfig(group_size=128, int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D)
+    except ImportError:
+        from torchao.quantization import int4_weight_only        # older torchao
+        cfg = int4_weight_only(group_size=128)
+    quantize_(model, cfg)
     bytes_tok = nparams * 0.5 + 100352 * 2560 * 2   # int4 linears + bf16 embeds (approx)
     label = "int4"
 with torch.device(dev):
@@ -42,15 +51,18 @@ x = torch.randint(0, args.vocab_size, (1, plen), device=dev)
 cur = prefill(model, x, torch.arange(plen, device=dev)).view(1, 1)
 ipos = torch.tensor([plen], device=dev)
 
+def step(cur, ipos):
+    torch.compiler.cudagraph_mark_step_begin()           # torch 2.11+: new cudagraph step
+    out, _ = decode(model, cur, ipos)
+    return out.clone().view(1, 1), ipos + 1              # clone out of the graph pool before reuse
+
 with torch.no_grad():
     for _ in range(10):                                  # warmup + compile
-        cur, _ = decode(model, cur, ipos)
-        cur = cur.view(1, 1); ipos = ipos + 1
+        cur, ipos = step(cur, ipos)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(a.gen):
-        cur, _ = decode(model, cur, ipos)
-        cur = cur.view(1, 1); ipos = ipos + 1
+        cur, ipos = step(cur, ipos)
     torch.cuda.synchronize()
     dt = time.perf_counter() - t0
 
