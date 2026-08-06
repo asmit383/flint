@@ -17,6 +17,10 @@ it's fast or slow. Where a projection existed, it's marked and superseded by the
 
 `chat.py` runs the whole 40-layer decode on the **megakernel** (our int4 path) with real Granite weights:
 
+![flint chat demo](assets/chat-demo.gif)
+
+*(real-time; [full-quality clip](assets/chat-demo.mp4))*
+
 ```bash
 python chat.py               # interactive; watch the tok/s
 python chat.py --selftest    # one prompt, checks coherence + prints tok/s
