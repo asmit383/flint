@@ -33,7 +33,7 @@ draft = DraftHead(dim, nh, a.inter).to(dev).to(torch.bfloat16)
 nparam = sum(p.numel() for p in draft.parameters())
 print(f"draft head: {nparam/1e6:.1f}M params (dim={dim}, heads={nh}, inter={a.inter})")
 
-shards = sorted(glob.glob(os.path.join(a.data, "shard_*.pt")))
+shards = sorted(glob.glob(os.path.join(a.data, "*shard_*.pt")))
 data = [torch.load(s, map_location="cpu") for s in shards]
 ids = torch.cat([d["ids"] for d in data]); feat = torch.cat([d["feat"] for d in data])
 N, ctx = ids.shape

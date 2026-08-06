@@ -69,7 +69,7 @@ if __name__ == "__main__":
         if IN not in xs: xs[IN] = torch.randn(1, IN, device=dev, dtype=torch.bfloat16)
 
     def run_ours():
-        for Wq, sc, IN in ours: m.int4_gemv_v(Wq, sc, xs[IN].view(IN), 8)
+        for Wq, sc, IN in ours: m.int4_gemv_v(Wq, sc, xs[IN].view(IN), 8 if IN == 8192 else 6)
     def run_tiny():
         for lin, (_, _, IN) in zip(tiny, ours): lin(xs[IN])
 
