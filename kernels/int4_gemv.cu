@@ -19,6 +19,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 
 template<int NACC>
 __global__ void int4_gemv_kernel(
@@ -535,6 +536,73 @@ torch::Tensor int4_spmv(torch::Tensor Wcol, torch::Tensor scale_col, torch::Tens
   return yf.to(torch::kBFloat16);
 }
 
+// Tensor-core (WMMA) int4 GEMV. Column-major weights ARE W^T = the MMA's B[K,N] matrix. Each warp owns
+// an N-tile of 16 outputs, streams K in 16-chunks: dequant int4->bf16 on CUDA cores into a shared tile,
+// put h into row 0 of the A[M=16,K=16] tile (M=1 -> rows 1..15 zero, the fundamental 15/16 MMA waste at
+// B=1), mma_sync, accumulate. Reads all weights (the bytes) but offloads the MAC to the tensor core.
+using namespace nvcuda;
+__global__ void int4_gemv_wmma_kernel(
+    const uint32_t* __restrict__ Wcol,          // [IN, OUT/8]  (= W^T packed, 8 outputs/word)
+    const __nv_bfloat16* __restrict__ scale_col,// [IN/128, OUT]
+    const __nv_bfloat16* __restrict__ h,        // [IN]
+    __nv_bfloat16* __restrict__ y,
+    int IN, int OUT) {
+  const int warp_g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int n0 = warp_g * 16;                    // this warp's 16 outputs
+  if (n0 >= OUT) return;
+  const int lane = threadIdx.x & 31;
+  const int wl = threadIdx.x >> 5;               // warp index within block
+  const int OW = OUT >> 3;
+
+  extern __shared__ __nv_bfloat16 sm[];          // per-warp: A[16*16] then B[16*16]
+  __nv_bfloat16* At = sm + wl * 512;
+  __nv_bfloat16* Bt = At + 256;
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+  wmma::fill_fragment(c, 0.0f);
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b;
+
+  for (int k0 = 0; k0 < IN; k0 += 16) {
+    const int g = k0 >> 7;
+    for (int i = lane; i < 256; i += 32) {       // fill A and B tiles (256 entries each)
+      const int r = i >> 4, cc = i & 15;         // r=k-row, cc=col
+      At[i] = (r == 0) ? h[k0 + cc] : __float2bfloat16(0.0f);   // A[m=r, k=cc]; only m=0 is real
+      const uint32_t w = Wcol[(size_t)(k0 + r) * OW + ((n0 + cc) >> 3)];
+      const int q = (w >> (4 * ((n0 + cc) & 7))) & 0xF;
+      const float sc = __bfloat162float(scale_col[(size_t)g * OUT + n0 + cc]);
+      Bt[i] = __float2bfloat16((float(q) - 8.0f) * sc);          // B[k=r, n=cc] = dequant W^T
+    }
+    __syncwarp();
+    wmma::load_matrix_sync(a, At, 16);
+    wmma::load_matrix_sync(b, Bt, 16);
+    wmma::mma_sync(c, a, b, c);
+    __syncwarp();
+  }
+  // c row 0 holds y[n0..n0+16]; store via shared float then write
+  __shared__ float ctmp[256 * 8];                // per-warp 16x16 float
+  float* Ct = ctmp + wl * 256;
+  wmma::store_matrix_sync(Ct, c, 16, wmma::mem_row_major);
+  if (lane < 16) y[n0 + lane] = __float2bfloat16(Ct[lane]);      // row 0
+}
+
+torch::Tensor int4_gemv_wmma(torch::Tensor Wcol, torch::Tensor scale_col, torch::Tensor h, int64_t OUT) {
+  const int IN = Wcol.size(0);
+  auto y = torch::empty({OUT}, h.options());
+  const uint32_t* wc = reinterpret_cast<const uint32_t*>(Wcol.data_ptr<int32_t>());
+  const __nv_bfloat16* scc = reinterpret_cast<const __nv_bfloat16*>(scale_col.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* hp = reinterpret_cast<const __nv_bfloat16*>(h.data_ptr<at::BFloat16>());
+  __nv_bfloat16* yp = reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>());
+  const int warps_per_block = 8;
+  const int nthreads = warps_per_block * 32;
+  const int nwarps = (OUT + 15) / 16;
+  const int grid = (nwarps + warps_per_block - 1) / warps_per_block;
+  const size_t shmem = warps_per_block * 512 * sizeof(__nv_bfloat16);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int4_gemv_wmma_kernel<<<grid, nthreads, shmem, stream>>>(wc, scc, hp, yp, IN, OUT);
+  return y;
+}
+
 torch::Tensor int4_gemv_fd(torch::Tensor Wq, torch::Tensor scales, torch::Tensor x, int64_t nacc) {
   const int OUT = Wq.size(0);
   const int ncols = Wq.size(1);
@@ -637,4 +705,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int4_gemv_v", &int4_gemv_v, "int4 weight-only GEMV, contiguous + 128-bit vector x-load (B=1)");
   m.def("int4_gemv_fd", &int4_gemv_fd, "int4 weight-only GEMV, fast bf16x2 dequant (B=1)");
   m.def("int4_spmv", &int4_spmv, "activation-sparse int4 GEMV, column-major skip (B=1)");
+  m.def("int4_gemv_wmma", &int4_gemv_wmma, "tensor-core (WMMA) int4 GEMV (B=1)");
 }

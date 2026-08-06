@@ -89,7 +89,14 @@ if __name__ == "__main__":
     Wq, scales = quant_pack_row(W, G)
     dense_ms = graph_time(lambda: m.int4_gemv_v(Wq, scales, h, 8))
     dbytes = OUT * IN * 0.5 + (IN // G) * OUT * 2
-    print(f"\ndense int4_gemv_v:  {dense_ms*1e3:6.2f} us  MBU {100*dbytes/(dense_ms*1e-3)/a.peak_bw:5.1f}%  (reads 100% of weights)")
+    print(f"\ndense int4_gemv_v (CUDA-core):  {dense_ms*1e3:6.2f} us  MBU {100*dbytes/(dense_ms*1e-3)/a.peak_bw:5.1f}%")
+    # tensor-core WMMA dense (uses the same column-major Wcol = W^T)
+    yw = m.int4_gemv_wmma(Wcol, scale_col, h, OUT).float()
+    y_dense_ref = (Wdq @ h.float())
+    relw = (yw - y_dense_ref).norm().item() / (y_dense_ref.norm().item() + 1e-9)
+    wmma_ms = graph_time(lambda: m.int4_gemv_wmma(Wcol, scale_col, h, OUT))
+    print(f"dense int4_gemv_wmma (tensor-core):  {wmma_ms*1e3:6.2f} us  MBU {100*dbytes/(wmma_ms*1e-3)/a.peak_bw:5.1f}%  "
+          f"speedup vs CUDA {dense_ms/wmma_ms:4.2f}x  (rel {relw:.4f})")
     print(f"sparse int4_spmv (reads ~{100*frac_kept:.0f}% of weights):")
     for js in a.jsplit:
         ms = graph_time(lambda: m.int4_spmv(Wcol, scale_col, h, thr, OUT, js))
