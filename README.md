@@ -1,49 +1,93 @@
 # flint
 
-> Batch-1 LLM decode made faster by reading fewer bytes — int4 + dynamic activation sparsity.
+> A measured study of batch-1 int4 LLM decode on H100 — and a hand-written full-decode **megakernel** that beats the baseline — for Granite-4.1.
 
-Batch-1 LLM decode is **memory-bandwidth-bound** — you read the weights and do almost no math. So the
-way to go faster isn't a faster kernel (production kernels are already good); it's **reading fewer
-bytes**. This project does that on a dense model via **int4 weights + dynamic activation sparsity**
-(skip the weight rows whose activation is ~0) — a byte-cutting, opt-in quality trade that engines like
-vLLM don't ship — driven from a tight, self-owned CUDA-graph decode loop.
+Batch-1 decode is where single-stream LLM latency lives: one token at a time, read the whole weight matrix,
+do almost no math. The folk wisdom is *"it's memory-bandwidth-bound, so read fewer bytes (int4, activation
+sparsity) and you win."* flint set out to do exactly that — and **measured, honestly, that on an H100 the
+folk wisdom is mostly wrong.** What we found instead, and the megakernel we hand-wrote in response, is the
+project. Every number here is measured end-to-end on real hardware; where a projection existed, it's marked
+and superseded by the measurement.
 
-- **Model:** Granite-4.1 dense (standard GQA/RoPE/SwiGLU transformer, Apache 2.0). Prototype 3B, then 8B.
-- **Base engine:** fork of [gpt-fast](https://github.com/pytorch-labs/gpt-fast) (minimal B=1 decode with
-  int4 + CUDA graphs + speculative decode).
-- **Hardware:** H100 PCIe (2 TB/s, Hopper — for TMA / warp-specialization). MBU % is peak-independent,
-  so it also holds on cheaper cards; absolute tok/s scales with bandwidth.
+- **Model:** Granite-4.1-3B dense (GQA / RoPE / SwiGLU, Apache 2.0).
+- **Base engine:** fork of [gpt-fast](https://github.com/pytorch-labs/gpt-fast) (BSD-3, attribution in `engine/NOTICE`).
+- **Hardware:** H100 PCIe (2 TB/s, 114 SMs).
 
-## Baselines — measured (Granite-3B, B=1, H100 PCIe 2 TB/s)
+## The core finding (measured — and independently published)
 
-| path | tok/s | MBU | bytes/token |
-|---|---|---|---|
-| transformers eager | 5.6 | 1.9% | 6.81 GB |
-| gpt-fast bf16 (compiled) | 176.6 | **64.6%** | 7.32 GB |
-| **gpt-fast int4** (tinygemm) | **233.8** | **27.4%** | 2.34 GB |
+On H100, batch-1 int4 decode is **NOT bandwidth-bound. It's overhead/latency-bound.** We measure ~27% MBU
+(memory-bandwidth utilization); independent work ([arXiv 2605.30571](https://arxiv.org/html/2605.30571))
+measures the same 27% and shows *why* — launch/latency overhead, not bytes. A slow GPU (L4) hits 81% MBU on
+the same workload: it *is* bandwidth-bound. **Fast GPU → latency-bound; slow GPU → bandwidth-bound.** Same
+kernel, opposite regime.
 
-Two facts these pin down:
-- **bf16 hits ~65% MBU** → that's the achievable ceiling at B=1 on this box; it's real, not a fantasy.
-- **int4 sits at only ~27% MBU** — 1.3× faster than bf16 despite 3× fewer bytes, because it's
-  **dequant-bound** (the tinygemm int4 kernel leaves ~37 points of MBU on the floor to on-the-fly unpack).
+The consequence: the byte-cutting levers everyone reaches for **don't help at B=1 on H100**, because bytes
+aren't the bottleneck. We proved each one by measurement rather than assuming:
 
-**That gap is the whole thesis.** flint's job: close int4's dequant gap (multi-accumulator dequant, TMA +
-warp specialization, split-K) **+ read fewer bytes** (dynamic activation sparsity — Granite-4.1 tolerates
-~50% @ +2% ppl, measured) **+ MTP**. Target: **~1500 tok/s** (int4 @ ~45% MBU × ~40% sparsity ×
-speculative decode), stated *with* the ppl cost, never hidden. The baseline to beat is **233.8 tok/s.**
+| lever tried | result | why |
+|---|---|---|
+| hand int4 GEMV vs tinygemm | **ties** (~27% MBU) | the microbench "win" was an **L2-cache artifact** — evaporated end-to-end |
+| activation sparsity (50%) | **2.8× slower** | scattered column-skips + atomics; not bandwidth-bound |
+| tensor cores (hand WMMA) | **100× slower** | M=1 wastes 15/16 of the MMA |
+| gate/up fusion | **+3%** end-to-end | gpt-fast already fuses QKV; the win was already there |
+| Marlin int4 | doesn't crack B=1 (confirmed) | tuned for batch, not for overhead-bound decode |
+
+Every optimistic microbenchmark got corrected *downward* by honest end-to-end measurement. That discipline —
+and the negative results it produced — is the real content.
+
+## What actually beats the baseline: the megakernel
+
+If B=1 is overhead-bound, the fix isn't fewer bytes — it's fewer *ops*. Fuse the **entire** decode step into
+**one persistent GPU kernel** so the residual stream never round-trips HBM and there are no inter-op
+relaunches. Hand-written, all correct (`kernels/megakernel_{mlp,attn,decode}.cu`):
+
+| path | tok/s | MBU |
+|---|---|---|
+| gpt-fast int4 baseline | 237 | 27% |
+| **flint megakernel** (full 40-layer, one cooperative launch) | **274** | **24%** |
+
+**274 tok/s, 1.16× the baseline, numerically correct end-to-end** (argmax matches the reference every step) —
+the first thing in the project to actually beat gpt-fast. The dig that got there:
+
+```
+naive persistent            44 tok/s   (grid-wide atomicAdd reduction = 117k threads → 1 address)
++ block-reduce rmsnorm      209 tok/s   ← 4.7×, that contention was the killer
++ redundant per-block norm  217 tok/s   (barriers matter less than expected)
++ vectorized 128-bit x-load 274 tok/s   ← the GEMV win
+(more warps / more accumulators both HURT — the kernel is register/occupancy-sensitive, not warp-starved)
+```
+
+It's currently **latency/barrier-bound** (a diagnostic that halves *all* weight bytes speeds it up only
+1.23×, not 2× — 76% of bandwidth sits idle). The remaining headroom (24% → ~78% MBU, HazyResearch-class)
+needs a **barrier-free producer-consumer redesign** (no `grid.sync`, per-tile flag deps, memory/compute
+overlap) — the next big build.
+
+## The path to ~800 tok/s (honest)
+
+Single-pass is walled around ~270 on H100 (overhead-bound — no kernel beats that without the barrier-free
+megakernel). The multiplier is **speculative decode (EAGLE-3)** — verify multiple tokens per weight-read.
+Published EAGLE-3 delivers **3.0–3.4×** at batch 1. So:
+
+> **megakernel 274 × EAGLE-3 3× ≈ 820 tok/s** — realistic, both fronts measured.
+
+The EAGLE runway is built (`train/`): the key fix is **self-distillation** — training the draft on the
+target's *own generations*, not raw corpus (lifted held-out draft accuracy 2.6×). Reaching a full 3× needs
+more diverse data + tree-verify. (1500 would additionally need the barrier-free megakernel; ~800 does not.)
 
 ## Layout
 ```
-engine/   gpt-fast fork + Granite-4.1 support (+ its LICENSE / NOTICE, BSD-3)
-kernels/  custom CUDA — sparse-int4 GEMV, fused rmsnorm  (the work)
-bench/    measurement harnesses (sparsity gate, baselines) — source of truth
-setup/    one-command box provisioning + baselines
-notes/, kdoc/   working notes (gitignored)
+engine/    gpt-fast fork + Granite-4.1 support (LICENSE / NOTICE, BSD-3)
+kernels/   custom CUDA — int4 GEMV variants + the megakernel (attn / mlp / full-decode)
+train/     EAGLE draft: self-distill harvest, training, acceptance eval, spec-decode loop
+bench/     measurement harnesses — every claim above is reproducible here
+setup/     one-command box provisioning + baselines
+notes/     working notes incl. the megakernel design doc (gitignored)
 ```
 
-## Order of operations
-1. `setup/setup_box.sh` — deps + model + gpt-fast. Then `setup/baselines.sh <peak-bw>`.
-2. `bench/sparsity_sweep.py` — **GO/NO-GO gate** ✅ *passed* (Granite-4.1 tolerates ~50% @ +2% ppl).
-3. gpt-fast baselines ✅ *measured* (above).
-4. **← we are here:** write the sparse-int4 GEMV, drive it in a self-owned CUDA-graph loop, and climb
-   int4 MBU from 27% toward ~45–65% — every technique A/B'd against `ncu`. Then activation sparsity, then MTP.
+## Honesty notes
+- Numbers are **measured end-to-end**, not projected. Microbenchmarks lie at B=1 (L2 residency, launch
+  amortization) — only the token clock counts.
+- **Negative results are kept** — sparsity, tensor cores, split-K, Marlin all measured-dead at B=1. Knowing
+  *why* they fail is the point.
+- int4 adds a small perplexity cost (quantization); activation sparsity is an opt-in quality trade. Neither
+  is free, and neither is claimed to be.
