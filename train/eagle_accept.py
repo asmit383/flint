@@ -42,11 +42,15 @@ def t_for(M):
         if k >= M: return T_M[k]
     return T_M[16]
 
-PROMPTS = {
-    "wiki1": "The city was founded in the early nineteenth century and grew rapidly during the industrial",
-    "wiki2": "In biology, the process of cellular respiration converts glucose and oxygen into energy that",
-    "prose": "The history of the Roman Empire is a subject that has fascinated scholars for centuries.",
-    "code":  "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n",
+PROMPTS = {                                                  # general baselines + a diverse HELD-OUT code set
+    "prose":       "The history of the Roman Empire is a subject that has fascinated scholars for centuries.",
+    "code_sort":   "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n",
+    "code_class":  "class BankAccount:\n    def __init__(self, owner, balance=0):\n",
+    "code_recur":  "def fib(n):\n    if n < 2:\n        return n\n",
+    "code_io":     "def load_config(path):\n    import json\n    with open(path) as f:\n",
+    "code_dict":   "def word_count(text):\n    counts = {}\n    for word in text.split():\n",
+    "code_search": "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n",
+    "code_str":    "def is_palindrome(s):\n    s = s.lower()\n    return ",
 }
 
 @torch.no_grad()
