@@ -20,6 +20,7 @@ ap.add_argument("--seed-len", type=int, default=32)
 ap.add_argument("--gen", type=int, default=224)
 ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--out", default="/root/eagle_gen")
+ap.add_argument("--domain", default="code", choices=["wiki", "code"])  # regime to specialize the drafter on
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 dev = "cuda"
@@ -31,9 +32,14 @@ model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16
 dim = model.config.hidden_size
 print(f"model={a.model} dim={dim} | generating {a.seqs} x {a.gen}-tok continuations (bs={a.bs})")
 
-pq = hf_hub_download(repo_id="Salesforce/wikitext", repo_type="dataset",
-                     filename="wikitext-103-raw-v1/train-00000-of-00002.parquet")
-paras = [t for t in pd.read_parquet(pq)["text"].tolist() if len(t.split()) > 40]
+if a.domain == "code":
+    from datasets import load_dataset
+    ds = load_dataset("flytech/python-codes-25k", split="train")   # Python code, ungated
+    paras = [t for t in ds["output"] if len(t.split()) > 20]
+else:
+    pq = hf_hub_download(repo_id="Salesforce/wikitext", repo_type="dataset",
+                         filename="wikitext-103-raw-v1/train-00000-of-00002.parquet")
+    paras = [t for t in pd.read_parquet(pq)["text"].tolist() if len(t.split()) > 40]
 # build seeds: first seed_len tokens of distinct passages
 seeds = []
 for p in paras:
