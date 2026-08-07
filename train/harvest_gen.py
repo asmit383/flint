@@ -30,7 +30,9 @@ if tok.pad_token_id is None: tok.pad_token = tok.eos_token
 model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16,
                                              device_map=dev, trust_remote_code=True).eval()
 dim = model.config.hidden_size
-print(f"model={a.model} dim={dim} | generating {a.seqs} x {a.gen}-tok continuations (bs={a.bs})")
+NL = model.config.num_hidden_layers
+FUSE_LAYERS = [NL // 4, NL // 2, NL]                          # EAGLE-3: fuse low/mid/high hidden states
+print(f"model={a.model} dim={dim} | fuse layers {FUSE_LAYERS} | generating {a.seqs} x {a.gen}-tok (bs={a.bs})")
 
 if a.domain == "code":
     from datasets import load_dataset
@@ -60,8 +62,10 @@ with torch.no_grad():
     for b in range(0, len(seeds), a.bs):
         batch = torch.stack(seeds[b:b + a.bs]).to(dev)                # [bs, seed_len]
         gen = model.generate(batch, do_sample=False, max_new_tokens=a.gen,
+                             min_new_tokens=a.gen,                     # force full length -> uniform shards
                              pad_token_id=tok.pad_token_id)            # [bs, seed+gen]
-        feat = model(gen, output_hidden_states=True).hidden_states[-1].to(torch.bfloat16).cpu()
+        hs = model(gen, output_hidden_states=True).hidden_states   # tuple len NL+1
+        feat = torch.cat([hs[i] for i in FUSE_LAYERS], -1).to(torch.bfloat16).cpu()  # [bs, L, fuse*dim]
         shard_t.append(gen.cpu()); shard_f.append(feat)
         if sum(x.shape[0] for x in shard_t) >= 256: flush()
         if (b // a.bs) % 5 == 0: print(f"  {b+len(batch)}/{len(seeds)}", flush=True)
@@ -70,6 +74,7 @@ torch.save({"norm": model.model.norm.state_dict(), "lm_head": model.lm_head.weig
             "embed": model.model.embed_tokens.weight.detach().cpu(),
             "logits_scaling": float(getattr(model.config, "logits_scaling", 1.0)),
             "dim": dim, "vocab": model.config.vocab_size,
-            "n_heads": model.config.num_attention_heads},
+            "n_heads": model.config.num_attention_heads,
+            "fuse": len(FUSE_LAYERS), "fuse_layers": FUSE_LAYERS},
            os.path.join(a.out, "heads.pt"))
 print(f"DONE: {si} shards + heads.pt in {a.out}")

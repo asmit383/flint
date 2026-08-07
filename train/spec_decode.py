@@ -18,6 +18,7 @@ ap.add_argument("--data", default="/root/eagle_data")
 ap.add_argument("--draft", default="/root/eagle_data/draft.pt")
 ap.add_argument("--new", type=int, default=200)
 ap.add_argument("--K", type=int, default=5)
+ap.add_argument("--prompt", default="The history of the Roman Empire is a subject that has fascinated scholars for centuries.")
 a = ap.parse_args()
 dev = "cuda"
 
@@ -88,7 +89,7 @@ def spec(prompt, n, K, W=32):
     torch.cuda.synchronize(); dt = time.perf_counter() - t0
     return gen[:n], n / dt, (n / passes)
 
-PROMPT = "The history of the Roman Empire is a subject that has fascinated scholars for centuries."
+PROMPT = a.prompt
 print(f"model={a.model}  draft K={a.K}  new={a.new}\n")
 g_ids, g_tps = plain(PROMPT, a.new)
 s_ids, s_tps, tpp = spec(PROMPT, a.new, a.K)

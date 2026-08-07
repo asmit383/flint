@@ -29,14 +29,15 @@ model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16
                                              device_map=dev, trust_remote_code=True).eval()
 H = torch.load(os.path.join(a.data, "heads.pt"), map_location="cpu")
 dim, vocab, lsc = H["dim"], H["vocab"], H["logits_scaling"]
+fuse_layers = H.get("fuse_layers", [-1])                     # EAGLE-3 fused layers (last-only if absent)
 embed = H["embed"].to(dev); lm_head = H["lm_head"].to(dev); norm_w = H["norm"]["weight"].to(dev)
 
 ck = torch.load(a.draft, map_location="cpu")
-draft = DraftHead(ck["dim"], ck["nh"], ck["inter"]).to(dev).to(torch.bfloat16)
+draft = DraftHead(ck["dim"], ck["nh"], ck["inter"], fuse=ck.get("fuse", 1)).to(dev).to(torch.bfloat16)
 draft.load_state_dict(ck["state"]); draft.eval()
 
-def head_logits(fp):                                         # feature -> vocab logits (frozen head)
-    return F.linear(rmsnorm(fp, norm_w), lm_head) / lsc
+def head_logits(fp):                                         # fused feature -> HIGH slice -> vocab logits
+    return F.linear(rmsnorm(fp[..., -dim:], norm_w), lm_head) / lsc
 
 PROMPTS = {
     "prose":       "The history of the Roman Empire is a subject that has fascinated scholars for centuries.",
@@ -77,7 +78,8 @@ def evaluate(prompt, K, b):
     ids = tok(prompt, return_tensors="pt").input_ids.to(dev)
     plen = ids.shape[1]
     gen = model.generate(ids, do_sample=False, max_new_tokens=a.gen, pad_token_id=tok.eos_token_id)[0]
-    feats = model(gen.unsqueeze(0), output_hidden_states=True).hidden_states[-1][0]
+    hs = model(gen.unsqueeze(0), output_hidden_states=True).hidden_states
+    feats = torch.cat([hs[i] for i in fuse_layers], -1)[0]   # fused low+mid+high [L, fuse*dim]
     L = gen.shape[0]
     i, passes, advanced = plen - 1, 0, 0
     while i < L - 1:

@@ -22,21 +22,26 @@ def apply_rope(x, cos, sin):                                   # x [B,nh,T,hd], 
     return x * cos + rotate_half(x) * sin
 
 class DraftHead(nn.Module):
-    def __init__(self, dim, nh, inter, rope_base=1e7):
+    # EAGLE-3-style multi-layer fusion: input is the target's fused (low+mid+high) feature [fuse*dim] plus the
+    # next-token embedding; the block runs in dim; fout predicts the next FUSED feature so it can autoregress.
+    # The token head reads the HIGH slice (last dim) of the fused feature. fuse=1 recovers last-layer-only.
+    def __init__(self, dim, nh, inter, fuse=1, rope_base=1e7):
         super().__init__()
         self.nh, self.hd, self.rope_base = nh, dim // nh, rope_base
-        self.merge = nn.Linear(2 * dim, dim, bias=False)
+        self.dim, self.fuse, self.fdim = dim, fuse, fuse * dim
+        self.merge = nn.Linear(self.fdim + dim, dim, bias=False)
         self.n1 = nn.Parameter(torch.ones(dim)); self.n2 = nn.Parameter(torch.ones(dim))
         self.q = nn.Linear(dim, dim, bias=False); self.k = nn.Linear(dim, dim, bias=False)
         self.v = nn.Linear(dim, dim, bias=False); self.o = nn.Linear(dim, dim, bias=False)
         self.gate = nn.Linear(dim, inter, bias=False); self.up = nn.Linear(dim, inter, bias=False)
         self.down = nn.Linear(inter, dim, bias=False)
+        self.fout = nn.Linear(dim, self.fdim, bias=False)     # predict next FUSED feature
 
-    def forward(self, feat, emb, positions=None):             # feat,emb [B,T,dim]
-        B, T, D = feat.shape
+    def forward(self, feat, emb, positions=None):             # feat [B,T,fdim], emb [B,T,dim]
+        B, T, _ = feat.shape
         if positions is None:
             positions = torch.arange(T, device=feat.device)
-        x = self.merge(torch.cat([feat, emb], -1))
+        x = self.merge(torch.cat([feat, emb], -1))            # [B,T,dim]
         h = rmsnorm(x, self.n1)
         q = self.q(h).view(B, T, self.nh, self.hd).transpose(1, 2)
         k = self.k(h).view(B, T, self.nh, self.hd).transpose(1, 2)
@@ -44,6 +49,7 @@ class DraftHead(nn.Module):
         cos, sin = rope_cache(positions, self.hd, self.rope_base, feat.device, feat.dtype)
         q = apply_rope(q, cos, sin); k = apply_rope(k, cos, sin)
         att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.o(att.transpose(1, 2).reshape(B, T, D))
+        x = x + self.o(att.transpose(1, 2).reshape(B, T, self.dim))
         h = rmsnorm(x, self.n2)
-        return x + self.down(F.silu(self.gate(h)) * self.up(h))
+        h = x + self.down(F.silu(self.gate(h)) * self.up(h))  # [B,T,dim]
+        return self.fout(h)                                   # [B,T,fdim] predicted next fused feature

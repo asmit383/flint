@@ -26,13 +26,14 @@ dev = "cuda"
 
 H = torch.load(os.path.join(a.data, "heads.pt"), map_location="cpu")
 dim, vocab, nh, lsc = H["dim"], H["vocab"], H["n_heads"], H["logits_scaling"]
+fuse = H.get("fuse", 1)                                     # EAGLE-3 multi-layer fusion factor
 embed = H["embed"].to(dev)                                  # [vocab, dim] frozen
 lm_head = H["lm_head"].to(dev)                              # [vocab, dim] frozen (tied)
 norm_w = H["norm"]["weight"].to(dev)                        # RMSNorm weight, frozen
 
-draft = DraftHead(dim, nh, a.inter).to(dev).to(torch.bfloat16)
+draft = DraftHead(dim, nh, a.inter, fuse=fuse).to(dev).to(torch.bfloat16)
 nparam = sum(p.numel() for p in draft.parameters())
-print(f"draft head: {nparam/1e6:.1f}M params (dim={dim}, heads={nh}, inter={a.inter})")
+print(f"draft head: {nparam/1e6:.1f}M params (dim={dim}, heads={nh}, inter={a.inter}, fuse={fuse})")
 
 shards = sorted(glob.glob(os.path.join(a.data, "*shard_*.pt")))
 data = [torch.load(s, map_location="cpu") for s in shards]
@@ -44,8 +45,8 @@ opt = torch.optim.AdamW(draft.parameters(), lr=a.lr, weight_decay=a.wd)
 steps = (N // a.bs) * a.epochs
 sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=steps, pct_start=0.05)
 
-def token_logits(fp):                                       # frozen head, Granite logits scaling
-    return F.linear(rmsnorm(fp, norm_w), lm_head) / lsc
+def token_logits(fp):                                       # fused fp -> head reads HIGH slice (last dim)
+    return F.linear(rmsnorm(fp[..., -dim:], norm_w), lm_head) / lsc
 
 step = 0
 for ep in range(a.epochs):
@@ -69,5 +70,5 @@ for ep in range(a.epochs):
                   f"1-tok-acc {100*acc:.1f}%", flush=True)
         step += 1
 
-torch.save({"state": draft.state_dict(), "dim": dim, "nh": nh, "inter": a.inter}, a.out)
+torch.save({"state": draft.state_dict(), "dim": dim, "nh": nh, "inter": a.inter, "fuse": fuse}, a.out)
 print(f"DONE -> {a.out}  (1-tok-acc is the ceiling for draft depth 1)")
