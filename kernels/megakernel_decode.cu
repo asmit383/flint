@@ -17,8 +17,28 @@ namespace cg = cooperative_groups;
 #else
 #define RSTEP 1
 #endif
+#ifdef HANDROLL_BARRIER
+__device__ unsigned int gb_counter;                      // hand-rolled grid barrier state: counter + sense
+__device__ unsigned int gb_sense;
+__device__ int gb_bsense[2048];                          // per-block sense (gridDim.x < 2048)
+__device__ __forceinline__ void hand_gsync() {           // sense-reversing counter barrier, core in inline PTX
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned int s = (unsigned int)(!gb_bsense[blockIdx.x]);
+    gb_bsense[blockIdx.x] = (int)s;
+    unsigned int old;
+    asm volatile("membar.gl;" ::: "memory");
+    asm volatile("atom.inc.u32 %0, [%1], %2;" : "=r"(old) : "l"(&gb_counter), "r"(gridDim.x - 1) : "memory");
+    if (old == gridDim.x - 1) asm volatile("st.global.u32 [%0], %1;" :: "l"(&gb_sense), "r"(s) : "memory");
+    else { unsigned int v; do { asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(&gb_sense) : "memory"); } while (v != s); }
+  }
+  __syncthreads();
+}
+#endif
 #ifdef NOSYNC
 #define GSYNC()      // diagnostic: no-op the grid barriers (garbage output, measures barrier cost)
+#elif defined(HANDROLL_BARRIER)
+#define GSYNC() hand_gsync()
 #else
 #define GSYNC() grid.sync()
 #endif
@@ -174,6 +194,11 @@ __global__ void decode_mega(
   cg::grid_group grid = cg::this_grid();
   const int tid = blockIdx.x * blockDim.x + threadIdx.x, nthreads = gridDim.x * blockDim.x;
   const int warp = tid >> 5, lane = tid & 31, nwarps = nthreads >> 5;
+#ifdef HANDROLL_BARRIER
+  if (tid == 0) { gb_counter = 0; gb_sense = 0; }         // reset barrier state; one grid.sync makes it visible
+  if (threadIdx.x == 0) gb_bsense[blockIdx.x] = 0;
+  grid.sync();
+#endif
   const size_t qkv_st = (size_t)(DIM + 2 * NKV * HD) * (DIM >> 3), sqkv_st = (size_t)(DIM + 2 * NKV * HD) * (DIM >> 7);
   const size_t wo_st = (size_t)DIM * (DIM >> 3), so_st = (size_t)DIM * (DIM >> 7);
   const size_t wgu_st = (size_t)(2 * INTER) * (DIM >> 3), sgu_st = (size_t)(2 * INTER) * (DIM >> 7);

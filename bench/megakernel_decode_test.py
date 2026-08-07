@@ -41,8 +41,10 @@ def build_layers(NL, dev, want_dq=False):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--mode", default="correct"); ap.add_argument("--peak-bw", type=float, default=2.0e12)
     ap.add_argument("--gen", type=int, default=32); a = ap.parse_args(); dev = "cuda"
-    m = load(name="flint_mkd", sources=[os.path.join(HERE, "kernels/megakernel_decode.cu")],
-             extra_cuda_cflags=["-O3", "--use_fast_math"], verbose=False)
+    _hb = bool(os.environ.get("HANDROLL"))               # HANDROLL=1 -> hand-rolled (inline PTX) grid barrier
+    _cf = ["-O3", "--use_fast_math"] + (["-DHANDROLL_BARRIER"] if _hb else [])
+    m = load(name="flint_mkd" + ("_hb" if _hb else ""), sources=[os.path.join(HERE, "kernels/megakernel_decode.cu")],
+             extra_cuda_cflags=_cf, verbose=False)
     torch.manual_seed(0)
     NL = 1 if a.mode == "correct" else 40
     P, n1, n2, dq = build_layers(NL, dev, want_dq=(a.mode == "correct"))
