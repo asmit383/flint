@@ -20,6 +20,7 @@ ap.add_argument("--lr", type=float, default=3e-4)
 ap.add_argument("--feat-w", type=float, default=0.1)
 ap.add_argument("--wd", type=float, default=0.0)
 ap.add_argument("--inter", type=int, default=4096)
+ap.add_argument("--rollout", type=int, default=3)            # multi-step: train on the draft's OWN predictions (EAGLE-2 fix)
 ap.add_argument("--out", default="/root/eagle_data/draft.pt")
 a = ap.parse_args()
 dev = "cuda"
@@ -55,13 +56,21 @@ for ep in range(a.epochs):
         idx = perm[b:b + a.bs]
         f = feat[idx].to(dev).to(torch.bfloat16)            # [B,ctx,dim]
         t = ids[idx].to(dev)
-        # input (f_i, emb(t_{i+1})) -> predict f_{i+1}; token target t_{i+2}
-        f_in = f[:, :-2]; emb_in = F.embedding(t[:, 1:-1], embed).to(torch.bfloat16)
-        f_tgt = f[:, 1:-1]; tok_tgt = t[:, 2:]
-        f_pred = draft(f_in, emb_in)
-        floss = F.smooth_l1_loss(f_pred.float(), f_tgt.float())
-        logits = token_logits(f_pred).float()
-        tloss = F.cross_entropy(logits.reshape(-1, vocab), tok_tgt.reshape(-1))
+        # multi-step rollout: at depth d feed the draft's OWN predicted feature forward (not the target's),
+        # so it learns to recover from its own error — matches inference, closes the exposure-bias gap.
+        D = a.rollout; L = f.shape[1] - D - 1
+        fcur = f[:, :L]; floss = 0.0; tloss = 0.0; logits = None; tok_tgt = None
+        for d in range(D):
+            emb_d = F.embedding(t[:, d + 1:d + 1 + L], embed).to(torch.bfloat16)
+            pos_d = torch.arange(d, d + L, device=dev)
+            fp = draft(fcur, emb_d, pos_d)
+            f_tgt_d = f[:, d + 1:d + 1 + L]; tok_tgt_d = t[:, d + 2:d + 2 + L]
+            floss = floss + F.smooth_l1_loss(fp.float(), f_tgt_d.float())
+            lg = token_logits(fp).float()
+            tloss = tloss + F.cross_entropy(lg.reshape(-1, vocab), tok_tgt_d.reshape(-1))
+            if d == 0: logits, tok_tgt = lg, tok_tgt_d
+            fcur = fp                                       # <- own prediction forward
+        floss = floss / D; tloss = tloss / D
         loss = tloss + a.feat_w * floss
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         if step % 50 == 0:

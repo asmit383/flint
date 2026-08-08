@@ -22,13 +22,15 @@ __global__ void gemv_mk(const uint32_t* __restrict__ Wq, const __nv_bfloat16* __
   for (int m = 0; m < M; m++) acc[m] = 0.f;
   for (int col = lane; col < ncols; col += 32) {
     const uint32_t w = Wrow[col]; const float sc = __bfloat162float(srow[col >> 4]);   // weight read ONCE
+    float wdq[8];                                        // dequant the 8 nibbles ONCE (not M times)
+    #pragma unroll
+    for (int nib = 0; nib < 8; nib++) wdq[nib] = (float((w >> (4 * nib)) & 0xF) - 8.0f) * sc;
     #pragma unroll
     for (int m = 0; m < M; m++) {
       const int4 xr = __ldg(reinterpret_cast<const int4*>(&X[(size_t)m * IN + (col << 3)]));
       const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xr);
       #pragma unroll
-      for (int nib = 0; nib < 8; nib++)
-        acc[m] += (float((w >> (4 * nib)) & 0xF) - 8.0f) * sc * __bfloat162float(xb[nib]);
+      for (int nib = 0; nib < 8; nib++) acc[m] += wdq[nib] * __bfloat162float(xb[nib]);   // pure FMA
     }
   }
   #pragma unroll

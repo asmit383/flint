@@ -21,6 +21,7 @@ ap.add_argument("--gen", type=int, default=224)
 ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--out", default="/root/eagle_gen")
 ap.add_argument("--domain", default="code", choices=["wiki", "code"])  # regime to specialize the drafter on
+ap.add_argument("--fuse", type=int, default=1)               # 1 = last-layer feature; 3 = EAGLE-3 low/mid/high
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 dev = "cuda"
@@ -31,7 +32,7 @@ model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16
                                              device_map=dev, trust_remote_code=True).eval()
 dim = model.config.hidden_size
 NL = model.config.num_hidden_layers
-FUSE_LAYERS = [NL // 4, NL // 2, NL]                          # EAGLE-3: fuse low/mid/high hidden states
+FUSE_LAYERS = [NL] if a.fuse == 1 else [NL // 4, NL // 2, NL]  # fuse=1: last-layer only; else low/mid/high
 print(f"model={a.model} dim={dim} | fuse layers {FUSE_LAYERS} | generating {a.seqs} x {a.gen}-tok (bs={a.bs})")
 
 if a.domain == "code":
