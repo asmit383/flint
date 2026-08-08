@@ -78,43 +78,46 @@ textbook EAGLE-2 gap: errors compound and chains broke ~token 3. Retraining with
 the draft's own prediction forward at each depth, so it learns to recover from its own error) closed it:
 held-out code chain **1.76 → 2.52**, tree **2.46 → 4.28**. This removes acceptance as the wall.
 
-## 6. Wiring the multiplier — the verify-cost de-risk
+## 6. Spec-decode ON the megakernel — built, measured end-to-end
 
-Naive projection is `acceptance × 275`. It's **wrong** — the M=K verify pass (verifying K tokens in one
-forward, weights read once) costs more than M=1. Measured `verify_cost(M) = time(M)/time(1)`, L2-cold,
-scalar M=K int4 GEMV:
+Two pieces built and wired onto the int4 engine (not a bf16 stand-in):
+- **M=K verify megakernel** (`kernels/verify_mega.cu`): scores K+1 candidates in ONE cooperative int4
+  launch, every weight row read once. **Bit-exact vs the M=1 megakernel** (rel-L2 0.0000, all argmax match).
+  Returns logits + the post-final-norm feature the draft rolls on. Batching all M queries into 2 grid-syncs
+  (not 2M) flattened the cost a lot: `verify_cost(M) = time(M)/time(1)`, L2-cold, on the megakernel:
 
-| M | verify_cost | net tok/s = 275 × accepted / verify_cost (acc ~1.8) |
-|---|---|---|
-| 1 | 1.00 | 275 |
-| 2 | 1.45 | 266 |
-| 4 | 1.86 | 251 |
-| 8 | 2.66 | 194 |
+  | M | verify_cost | verify ms |
+  |---|---|---|
+  | 1 | 1.00 | 3.9 |
+  | 3 | 1.64 | 6.6 |
+  | 4 | 1.96 | 7.9 |
+  | 8 | 2.65 | 10.6 |
 
-**At current acceptance, spec-decode LOSES** — every M below 275, because `accepted/verify_cost < 1`. The
-scalar M=K GEMV is register/compute-bound. Measuring this *before* building the full M=K megakernel avoided
-shipping a slower chat.
+- **`spec_mega.py`** — full loop: megakernel prefill → draft K → verify_mega M=K+1 → accept → update.
+  Coherent output. **Measured 116 tok/s @ K=3** (draft 9.8ms + verify 8.0ms, acc 2.11).
 
-**Fix — tensor-core M=K GEMM:** the "tensor cores waste 15/16 at M=1" reverses at M≥4 (fill 8/16 at M=8), so
-a tensor-core verify could drop `verify_cost(4)` from 1.86 → ~1.2.
+**The measured wall: at B=1, chain spec-decode loses to single-pass.**
+```
+net = accepted / (draft + verify);  even with a FREE draft: 2.11 / 8.0ms = 264 < 275
+```
+Verify(M=4) is 1.96× a single token — verifying 4 tokens costs ~2 tokens, and greedy chain accepts ~2, so
+it breaks even at best. The verify is **not flat** (register/occupancy-bound: M accumulators/thread drop
+occupancy, so the extra math doesn't fully hide in the 27%-MBU latency slack). Acceptance being solved
+(2.52/4.28) is necessary but not sufficient — the flat verify is what's missing.
 
-## 7. The path to 800
+## 7. The path above 275 — what it actually needs
 
 ```
 net tok/s = accepted / (draft_roll_time + verify_time)
 ```
-With acceptance solved (chain 2.52 / tree 4.28), the projection with a well-wired draft + verify:
-- chain 2.52, draft 2ms + int4 verify 7ms:  2.52/9ms ≈ **280** (beats the 275 single-pass ceiling)
-- tree 4.28, draft 3ms + bf16 flat verify 8.9ms:  4.28/11.9ms ≈ **360** (clears 350)
-- + int4 M=K megakernel verify at tree acceptance: → path to **800**
+Both remaining levers are real builds:
+- **Flat M=K verify** (`verify_cost(M) → ~1.1–1.2`): the whole-project thesis (B=1 is latency-bound, extra
+  math should hide) says it's possible, but the current kernel is register-bound. With a flat verify: chain
+  2.52/(2ms + 4.5ms) ≈ **388**; tree 4.28/(3ms + 6ms) ≈ **475**.
+- **Tree-verify serving loop** to cash in the 4.28 tree acceptance (tree attention mask in verify_mega,
+  longest-path accept, KV surgery). With today's *non-flat* verify: 4.28/(3ms + 10.6ms) ≈ **315** — the one
+  path that clears 275 without the flat-verify kernel, if live tree acceptance holds near 4.28.
 
-**The one remaining bottleneck: the draft rollout.** Live spec-decode is draft-bound — the K-step rollout
-runs ~20ms of eager Python (K tiny forwards, each launching ~15 kernels) and dominates the pass. The
-acceptance (2.52/4.28) is there but not yet realized as tok/s. The fix is a CUDA-graphed draft with a
-fixed preallocated KV cache (gpt-fast style) — a `torch.compile` over a *growing* cache recompiles per
-step; a fixed cache graphs cleanly. That collapses the rollout to ~2ms and converts the acceptance win
-directly into the ~280 (chain) / ~360 (tree) above.
-
-**Build order:** [done] self-distill drafter · [done] M=K GEMV cost measurement · [done] **multi-step
-rollout training (acceptance 1.76→2.52 / 2.46→4.28)** · [next] CUDA-graphed fixed-cache draft rollout ·
-[then] int4 M=K megakernel verify → 800.
+**Build order:** [done] self-distill drafter · [done] multi-step rollout training (acc 1.76→2.52 / 2.46→4.28)
+· [done] fixed-cache CUDA-graphed draft rollout · [done] **M=K verify megakernel + end-to-end spec_mega
+(116 tok/s, chain loses at B=1)** · [next] flat M=K verify (register/occupancy) AND/OR tree-verify loop.
