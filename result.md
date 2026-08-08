@@ -131,6 +131,24 @@ M=K matmul — idle at M=1, filled at M=8. That's the hard, multi-day int4-TC-GE
 fixed-cache CUDA-graphed draft · [done] M=K verify megakernel + end-to-end spec_mega/spec_tree (both correct,
 both lose to 275 at B=1) · [remaining] **flat int4 tensor-core M=K verify** — the one thing that flips it.
 
+## 9. Beating 275 — spec-decode on the megakernel WINS (285 tok/s)
+
+Three stacked fixes took chain spec-decode from a broken 25.9 to **285 tok/s, past the 275 single-pass**:
+
+| step | tok/s | what |
+|---|---|---|
+| draft-speed fix | 220 | manual CUDA graph (not torch.compile) + warm per-Wc autotune |
+| + bf16 verify | 260 | `__hfma2` bf16x2 accumulation, verify ~22% faster, argmax fidelity ~100% |
+| + whole-rollout graph | **285** | prime + all K-1 steps as ONE graph (RoPE is relative → fixed positions), draft 2.2→1.2ms |
+
+Best: **K=2 W=8 bf16 = 285 tok/s** (acc 1.92, draft 1.2ms + verify 5.13ms), **coherent**. Key corrections to
+the earlier verdict: (a) the verify is memory/latency-bound, NOT fp32-compute-bound (bf16 gave real speedup
+with 0 precision loss — 100% argmax fidelity, so tensor cores were never needed for *this* win); (b) the draft
+was never the acceptance problem — it was 73ms of per-shape autotune + cudagraph re-capture, now 1.2ms.
+**Spec-decode on the int4 megakernel now beats single-pass at B=1.** Toward 350: needs higher live acceptance
+(2.5+ vs today's 1.9–2.1) — a better/bigger-data draft — since the verify is already near its weight-latency
+floor at small M and the base megakernel is barrier-walled at 275/token.
+
 ## 8. End-to-end with a properly-fast draft (measured)
 
 Fixed two draft-speed bugs (spec_mega): the torch.compile cudagraph re-captured every pass (cooperative
