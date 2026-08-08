@@ -95,6 +95,7 @@ __global__ void verify_mega(
   float acc[M];
 
   for (int l = 0; l < NL; l++) {
+#ifndef NOATTN
     // ---- attention ----
     rmsnorm_mk<M>(grid, h, n1 + (size_t)l * DIM, xn, DIM, tid, nthreads);
     for (int row = warp; row < QKV; row += nwarps) {
@@ -173,6 +174,8 @@ __global__ void verify_mega(
         h[(size_t)m * DIM + row] = __float2bfloat16(__bfloat162float(h[(size_t)m * DIM + row]) + acc[m] * resid); }
     }
     GSYNC();
+#endif
+#ifndef NOMLP
     // ---- mlp ----
     rmsnorm_mk<M>(grid, h, n2 + (size_t)l * DIM, xn, DIM, tid, nthreads);
     for (int row = warp; row < INTER2; row += nwarps) {
@@ -195,13 +198,16 @@ __global__ void verify_mega(
         h[(size_t)m * DIM + row] = __float2bfloat16(__bfloat162float(h[(size_t)m * DIM + row]) + acc[m] * resid); }
     }
     GSYNC();
+#endif
   }
+#ifndef NOLM
   // final norm + LM head (M=K)
   rmsnorm_mk<M>(grid, h, nf, xn, DIM, tid, nthreads);
   for (int row = warp; row < VOCAB; row += nwarps) {
     wgemv_row_mk<M>(Wlm + (size_t)row * (DIM >> 3), s_lm + (size_t)row * (DIM >> 7), xn, DIM, lane, acc);
     if (lane == 0) { for (int m = 0; m < M; m++) logits[(size_t)m * VOCAB + row] = acc[m] / logits_scaling; }
   }
+#endif
 }
 
 std::vector<torch::Tensor> verify_mega_launch(
@@ -240,6 +246,17 @@ std::vector<torch::Tensor> verify_mega_launch(
   return {logits, xn};                                    // xn = post-final-norm feature [M,DIM] (EAGLE draft input)
 }
 
+std::vector<int64_t> verify_occupancy(int64_t M) {       // {regs/thread, blocks/SM, #SMs, total warps}
+  void* fn = (M == 1) ? (void*)verify_mega<1> : (M == 2) ? (void*)verify_mega<2>
+           : (M == 4) ? (void*)verify_mega<4> : (M == 8) ? (void*)verify_mega<8>
+           : (M == 6) ? (void*)verify_mega<6> : (void*)verify_mega<3>;
+  cudaFuncAttributes attr; cudaFuncGetAttributes(&attr, fn);
+  int bps = 0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, fn, 256, 0);
+  int nsm = 0; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+  return {(int64_t)attr.numRegs, bps, nsm, (int64_t)bps * nsm * 8};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("verify_mega_launch", &verify_mega_launch, "M=K int4 verify megakernel (persistent, B=1 spec-decode)");
+  m.def("verify_occupancy", &verify_occupancy, "regs/occupancy diagnostics per M");
 }
