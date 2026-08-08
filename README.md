@@ -4,7 +4,7 @@
 
 Batch-1 decode is where single-stream LLM latency lives: one token at a time, read the whole weight matrix,
 do almost no math. The folk wisdom is *"it's memory-bandwidth-bound, so read fewer bytes (int4, activation
-sparsity) and you win."* flint set out to do exactly that — and **measured, honestly, that on an H100 the
+sparsity) and you win."* flint set out to do exactly that — and **measured that on an H100 the
 folk wisdom is mostly wrong.** What we found instead, and the megakernel we hand-wrote in response, is the
 project. Every number here is measured end-to-end on real hardware; every result is annotated with *why*
 it's fast or slow. Where a projection existed, it's marked and superseded by the measurement.
@@ -62,7 +62,7 @@ aren't the bottleneck. We proved each one by measurement rather than assuming:
 | cp.async deep pipeline | **+1%** (26→26%) | more in-flight loads don't help when you're latency-bound, not load-parallelism-bound |
 | Marlin int4 | doesn't crack B=1 (also blocked on torch-2.11/Hopper) | tuned for batched throughput, not overhead-bound decode |
 
-Every optimistic microbenchmark got corrected *downward* by honest end-to-end measurement. That discipline —
+Every optimistic microbenchmark got corrected *downward* by end-to-end measurement. That discipline —
 and the negative results it produced — is the real content.
 
 ## What actually beats the baseline: the megakernel

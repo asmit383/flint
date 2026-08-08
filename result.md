@@ -65,18 +65,18 @@ Self-distillation drafter: seed Granite with Python-code prefixes, harvest **its
 
 **Acceptance (tokens/pass), held-out code prompts, 8k self-distill data:**
 
-| verify | tokens/pass |
-|---|---|
-| general (wiki/prose) | ~1.1 |
-| **chain** (code avg) | **1.87** |
-| tree branch=2 | 2.09 |
-| tree branch=4 | 2.27 |
-| **tree branch=8** | **2.46** (best prompt 2.70) |
+| verify | single-step train | **multi-step (rollout) train** |
+|---|---|---|
+| general (wiki/prose) | ~1.1 | — |
+| **chain** (code avg) | 1.76 | **2.52** |
+| tree branch=4 | 2.27 | 3.67 |
+| **tree branch=8** | 2.46 | **4.28** |
 
-Specialization + tree-verify: **1.1 → 2.46**, measured, held-out (spread 2.1–2.7 across 7 code prompts —
-generalizes, not overfit to one style). Tree-verify: for greedy decoding only the greedy path is
-acceptable, so a top-b tree accepts while the true token stays in the draft's top-b (no tree-attention-mask
-needed to measure the ceiling).
+**The acceptance breakthrough — exposure-bias fix.** The draft trained *single-step* (teacher-forced on the
+target's TRUE features) but ran *multi-step* at inference (autoregress on its OWN predicted features) — a
+textbook EAGLE-2 gap: errors compound and chains broke ~token 3. Retraining with a **K-step rollout** (feed
+the draft's own prediction forward at each depth, so it learns to recover from its own error) closed it:
+held-out code chain **1.76 → 2.52**, tree **2.46 → 4.28**. This removes acceptance as the wall.
 
 ## 6. Wiring the multiplier — the verify-cost de-risk
 
@@ -98,18 +98,23 @@ shipping a slower chat.
 **Fix — tensor-core M=K GEMM:** the "tensor cores waste 15/16 at M=1" reverses at M≥4 (fill 8/16 at M=8), so
 a tensor-core verify could drop `verify_cost(4)` from 1.86 → ~1.2.
 
-## 7. The path to 800 (measured, honest)
+## 7. The path to 800
 
 ```
-net tok/s = 275 (single-pass) × accepted / verify_cost
+net tok/s = accepted / (draft_roll_time + verify_time)
 ```
-- tensor-core verify only, current acceptance: 275 × 1.7/1.2 ≈ **390** (clears 350)
-- + EAGLE-3 acceptance (~3.5): 275 × 3.5/1.2 ≈ **800**
+With acceptance solved (chain 2.52 / tree 4.28), the projection with a well-wired draft + verify:
+- chain 2.52, draft 2ms + int4 verify 7ms:  2.52/9ms ≈ **280** (beats the 275 single-pass ceiling)
+- tree 4.28, draft 3ms + bf16 flat verify 8.9ms:  4.28/11.9ms ≈ **360** (clears 350)
+- + int4 M=K megakernel verify at tree acceptance: → path to **800**
 
-Needs **both** a cheap verify (tensor-core M=K GEMM) **and** higher acceptance (EAGLE-3). Neither alone gets
-there. EAGLE-3 multi-layer feature fusion was attempted and parked — a fused 2k draft overfit (98% train,
-2.10 held-out) vs the last-layer 8k draft's 2.46; the real gain likely needs token-prediction recurrence
-(not feature-prediction) + more data.
+**The one remaining bottleneck: the draft rollout.** Live spec-decode is draft-bound — the K-step rollout
+runs ~20ms of eager Python (K tiny forwards, each launching ~15 kernels) and dominates the pass. The
+acceptance (2.52/4.28) is there but not yet realized as tok/s. The fix is a CUDA-graphed draft with a
+fixed preallocated KV cache (gpt-fast style) — a `torch.compile` over a *growing* cache recompiles per
+step; a fixed cache graphs cleanly. That collapses the rollout to ~2ms and converts the acceptance win
+directly into the ~280 (chain) / ~360 (tree) above.
 
-**Build order:** (1) tensor-core M=K GEMM verify [milestone 1 — the M=K GEMV + this cost measurement — done];
-(2) full M=K megakernel decode; (3) spec serving loop + wire chat.py, measure net; (4) EAGLE-3 acceptance.
+**Build order:** [done] self-distill drafter · [done] M=K GEMV cost measurement · [done] **multi-step
+rollout training (acceptance 1.76→2.52 / 2.46→4.28)** · [next] CUDA-graphed fixed-cache draft rollout ·
+[then] int4 M=K megakernel verify → 800.
