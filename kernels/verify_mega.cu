@@ -19,6 +19,36 @@ template<int M>
 __device__ __forceinline__ void wgemv_row_mk(const uint32_t* __restrict__ Wrow,
     const __nv_bfloat16* __restrict__ srow, const __nv_bfloat16* __restrict__ x, int IN, int lane, float* out) {
   const int ncols = IN >> 3;
+#ifdef BF16ACC
+  // bf16x2 accumulation via __hfma2 (2x CUDA-core throughput vs fp32). The int4 GEMV is fp32-compute-bound
+  // at M>=4, so this is the pragmatic verify speedup short of tensor cores. Precision: bf16 accumulate.
+  __nv_bfloat162 acc2[M];
+  #pragma unroll
+  for (int m = 0; m < M; m++) acc2[m] = __float2bfloat162_rn(0.f);
+  for (int col = lane; col < ncols; col += 32) {
+    const uint32_t w = Wrow[col]; const float sc = __bfloat162float(srow[col >> 4]);
+    __nv_bfloat162 wdq2[4];                              // 8 nibbles as 4 half2 pairs, dequant ONCE
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float a = (float((w >> (8 * j)) & 0xF) - 8.0f) * sc, b = (float((w >> (8 * j + 4)) & 0xF) - 8.0f) * sc;
+      wdq2[j] = __floats2bfloat162_rn(a, b);
+    }
+    #pragma unroll
+    for (int m = 0; m < M; m++) {
+      const int4 xr = __ldg(reinterpret_cast<const int4*>(&x[(size_t)m * IN + (col << 3)]));
+      const __nv_bfloat162* xb2 = reinterpret_cast<const __nv_bfloat162*>(&xr);
+      #pragma unroll
+      for (int j = 0; j < 4; j++) acc2[m] = __hfma2(wdq2[j], xb2[j], acc2[m]);
+    }
+  }
+  #pragma unroll
+  for (int m = 0; m < M; m++) {
+    float a = __bfloat162float(acc2[m].x) + __bfloat162float(acc2[m].y);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+    out[m] = a;
+  }
+#else
   float acc[M];
   #pragma unroll
   for (int m = 0; m < M; m++) acc[m] = 0.f;
@@ -41,6 +71,7 @@ __device__ __forceinline__ void wgemv_row_mk(const uint32_t* __restrict__ Wrow,
     for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
     out[m] = acc[m];
   }
+#endif
 }
 
 // rmsnorm for M vectors: h[M, DIM] -> xn[M, DIM]. Redundant per-block reduction (h tiny + L2-hot).

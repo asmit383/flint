@@ -20,13 +20,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--draft", default="/root/eagle_ll8k/draft_ms.pt")
     ap.add_argument("--K", type=int, default=3); ap.add_argument("--W", type=int, default=32)
+    ap.add_argument("--bf16", action="store_true")     # bf16 __hfma2 verify accumulation (~22% faster)
     ap.add_argument("--max-new", type=int, default=256); ap.add_argument("--maxseq", type=int, default=2048)
     ap.add_argument("--selftest", action="store_true"); a = ap.parse_args()
     dev = "cuda"; torch.set_grad_enabled(False)
 
     print("compiling megakernel + verify ...", flush=True)
     dec = load(name="flint_dec", sources=[HERE + "/kernels/megakernel_decode.cu"], extra_cuda_cflags=["-O3", "--use_fast_math"])
-    ver = load(name="flint_ver", sources=[HERE + "/kernels/verify_mega.cu"], extra_cuda_cflags=["-O3", "--use_fast_math"])
+    _vf = ["-O3", "--use_fast_math"] + (["-DBF16ACC"] if a.bf16 else [])
+    ver = load(name=("flint_ver_bf16" if a.bf16 else "flint_ver"), sources=[HERE + "/kernels/verify_mega.cu"], extra_cuda_cflags=_vf)
     print("loading + int4-packing Granite ...", flush=True)
     W = load_packed(dev)
     tok = AutoTokenizer.from_pretrained(MODEL); eos = tok.eos_token_id
