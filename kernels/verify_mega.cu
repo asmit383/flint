@@ -81,6 +81,7 @@ __global__ void verify_mega(
     __nv_bfloat16* h, __nv_bfloat16* kc, __nv_bfloat16* vc,
     __nv_bfloat16* xn, __nv_bfloat16* qkv, __nv_bfloat16* gu, __nv_bfloat16* act, __nv_bfloat16* ao,
     float* pm, float* pd, float* pacc, float* logits,
+    const int* depth, const uint8_t* amask,               // tree: RoPE offset per node + [M,M] ancestor-or-self mask
     int DIM, int INTER, int NL, int VOCAB, int MAXSEQ, int pos, int WPH,
     float scale, float rope_base, float resid, float logits_scaling) {
   cg::grid_group grid = cg::this_grid();
@@ -108,7 +109,7 @@ __global__ void verify_mega(
     for (int hh = warp; hh < NH + NKV; hh += nwarps) {
       const int off = (hh < NH) ? hh * HD : DIM + (hh - NH) * HD;
       for (int m = 0; m < M; m++) {
-        __nv_bfloat16* base = qkv + (size_t)m * QKV + off; const int posm = pos + m;
+        __nv_bfloat16* base = qkv + (size_t)m * QKV + off; const int posm = pos + depth[m];
         for (int i = lane; i < HD / 2; i += 32) {
           const float freq = powf(rope_base, -2.0f * i / HD), ang = posm * freq, c = cosf(ang), sn = sinf(ang);
           const float x0 = __bfloat162float(base[i]), x1 = __bfloat162float(base[i + HD / 2]);
@@ -131,9 +132,10 @@ __global__ void verify_mega(
       if (head < NH) {
         const int kv = head / (NH / NKV);
         for (int m = 0; m < M; m++) {                    // loop queries INSIDE the warp (no grid sync between)
-          const int T = pos + m + 1; const __nv_bfloat16* q = qkv + (size_t)m * QKV + head * HD;
+          const int T = pos + M; const __nv_bfloat16* q = qkv + (size_t)m * QKV + head * HD;
           float mmax = -1e30f, denom = 0.f, outv[2] = {0.f, 0.f};
           for (int t = sub; t < T; t += WPH) {
+            if (t >= pos && !amask[m * M + (t - pos)]) continue;   // tree: attend prefix (t<pos) + ancestors only
             const __nv_bfloat16* kt = kc + l * kc_st + ((size_t)t * NKV + kv) * HD; float s = 0.f;
             for (int d = lane; d < HD; d += 32) s += __bfloat162float(q[d]) * __bfloat162float(kt[d]);
             #pragma unroll
@@ -214,8 +216,8 @@ std::vector<torch::Tensor> verify_mega_launch(
     torch::Tensor Wqkv, torch::Tensor s_qkv, torch::Tensor Wo, torch::Tensor s_o, torch::Tensor n1,
     torch::Tensor Wgu, torch::Tensor s_gu, torch::Tensor Wd, torch::Tensor s_d, torch::Tensor n2,
     torch::Tensor nf, torch::Tensor Wlm, torch::Tensor s_lm,
-    torch::Tensor h, torch::Tensor kc, torch::Tensor vc, int64_t pos, int64_t M,
-    double scale, double rope_base, double resid, double logits_scaling) {
+    torch::Tensor h, torch::Tensor kc, torch::Tensor vc, torch::Tensor depth, torch::Tensor amask,
+    int64_t pos, int64_t M, double scale, double rope_base, double resid, double logits_scaling) {
   const int DIM = h.size(1), NL = Wqkv.size(0), VOCAB = Wlm.size(0);
   const int INTER = Wd.size(2) * 8, MAXSEQ = kc.size(1), QKV = DIM + 2 * NKV * HD;
   auto opt = h.options();
@@ -223,9 +225,11 @@ std::vector<torch::Tensor> verify_mega_launch(
   auto gu = torch::empty({M, 2 * INTER}, opt), act = torch::empty({M, INTER}, opt), ao = torch::empty({M, DIM}, opt);
   auto logits = torch::empty({M, VOCAB}, opt.dtype(torch::kFloat32));
   int nthreads = 256, dev = 0; cudaGetDevice(&dev);
-  void* fn = (M == 1) ? (void*)verify_mega<1> : (M == 2) ? (void*)verify_mega<2>
-           : (M == 4) ? (void*)verify_mega<4> : (M == 8) ? (void*)verify_mega<8>
-           : (M == 6) ? (void*)verify_mega<6> : (void*)verify_mega<3>;
+  void* fn;                                              // dispatch EVERY M (trees need 5,7,9,...); no fall-through
+  #define VM(k) case k: fn = (void*)verify_mega<k>; break;
+  switch (M) { VM(1)VM(2)VM(3)VM(4)VM(5)VM(6)VM(7)VM(8)VM(9)VM(10)VM(11)VM(12)VM(13)VM(14)VM(15)VM(16)
+               VM(20)VM(24)VM(28)VM(32) default: TORCH_CHECK(false, "M must be 1..16,20,24,28,32"); }
+  #undef VM
   int bps = 0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, fn, nthreads, 0);
   int nsm = 0; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
   int grid = bps * nsm; int nwarps = grid * (nthreads >> 5); int WPH = nwarps / NH; if (WPH < 1) WPH = 1;
@@ -239,9 +243,10 @@ std::vector<torch::Tensor> verify_mega_launch(
   const __nv_bfloat16 *sqkv=Bc(s_qkv),*so=Bc(s_o),*n1p=Bc(n1),*sgu=Bc(s_gu),*sd=Bc(s_d),*n2p=Bc(n2),*nfp=Bc(nf),*slm=Bc(s_lm);
   __nv_bfloat16 *hp=Bm(h),*kcp=Bm(kc),*vcp=Bm(vc),*xnp=Bm(xn),*qkvp=Bm(qkv),*gup=Bm(gu),*actp=Bm(act),*aop=Bm(ao);
   float *lgp=logits.data_ptr<float>(),*pmp=pm.data_ptr<float>(),*pdp=pd.data_ptr<float>(),*paccp=pacc.data_ptr<float>();
+  const int* dpp = depth.data_ptr<int>(); const uint8_t* amp = amask.data_ptr<uint8_t>();
   int D=DIM,I=INTER,nl=NL,V=VOCAB,ms=MAXSEQ,p2=pos,wph=WPH; float sc=scale,rb=rope_base,rm=resid,ls=logits_scaling;
   void* args[]={&wqkv,&sqkv,&wo,&so,&n1p,&wgu,&sgu,&wd,&sd,&n2p,&nfp,&wlm,&slm,&hp,&kcp,&vcp,
-                &xnp,&qkvp,&gup,&actp,&aop,&pmp,&pdp,&paccp,&lgp,&D,&I,&nl,&V,&ms,&p2,&wph,&sc,&rb,&rm,&ls};
+                &xnp,&qkvp,&gup,&actp,&aop,&pmp,&pdp,&paccp,&lgp,&dpp,&amp,&D,&I,&nl,&V,&ms,&p2,&wph,&sc,&rb,&rm,&ls};
   cudaLaunchCooperativeKernel(fn, grid, nthreads, args, 0, at::cuda::getCurrentCUDAStream());
   return {logits, xn};                                    // xn = post-final-norm feature [M,DIM] (EAGLE draft input)
 }
