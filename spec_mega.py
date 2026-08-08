@@ -112,7 +112,8 @@ def main():
             feats = torch.cat([feats, vfeat[:acc + 1]])
             pos += 1 + acc; nxt = tgt[acc].view(1); passes += 1
         dt = time.perf_counter() - t0
-        print(f"\n\033[2m[profile] draft {t_draft/passes*1000:.1f}ms/pass | verify {t_ver/passes*1000:.1f}ms/pass | passes {passes}\033[0m")
+        if a.selftest:
+            print(f"\n\033[2m[profile] draft {t_draft/passes*1000:.1f}ms/pass | verify {t_ver/passes*1000:.1f}ms/pass | passes {passes}\033[0m")
         return n, dt, (n / passes if passes else 1)
 
     if a.selftest:
@@ -127,6 +128,29 @@ def main():
         n, dt, tpp = run(ids, cb)
         print(f"\n\033[2m⚡ {n} tokens · {n/dt:.1f} tok/s · {tpp:.2f} tokens/pass (spec-decode on megakernel)\033[0m")
         return
+
+    # interactive chat — spec-decode on the int4 megakernel
+    print(f"\nflint spec-decode chat · int4 megakernel · K={a.K}{' bf16' if a.bf16 else ''}. Ctrl-C to quit.\n")
+    msgs = []
+    while True:
+        try: user = input("\033[1myou›\033[0m ")
+        except (EOFError, KeyboardInterrupt): print(); break
+        if not user.strip(): continue
+        msgs.append({"role": "user", "content": user})
+        text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist()
+        if len(ids) >= a.maxseq - a.max_new:               # context full -> reset to the latest turn
+            msgs = msgs[-1:]; text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+            ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist()
+        sys.stdout.write("\033[1mflint›\033[0m "); sys.stdout.flush()
+        buf = {"ids": [], "prev": ""}
+        def cb(t):
+            if t == eos: return
+            buf["ids"].append(t); s = tok.decode(buf["ids"])
+            sys.stdout.write(s[len(buf["prev"]):]); sys.stdout.flush(); buf["prev"] = s
+        n, dt, tpp = run(ids, cb)
+        print(f"\n\033[2m⚡ {n/dt:.0f} tok/s · {tpp:.2f} tok/pass\033[0m\n")
+        msgs.append({"role": "assistant", "content": tok.decode(buf["ids"])})
 
 
 if __name__ == "__main__":
