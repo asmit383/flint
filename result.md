@@ -130,3 +130,22 @@ M=K matmul — idle at M=1, filled at M=8. That's the hard, multi-day int4-TC-GE
 **Build order:** [done] self-distill drafter · [done] multi-step rollout (acc 1.76→2.52 / 2.46→4.28) · [done]
 fixed-cache CUDA-graphed draft · [done] M=K verify megakernel + end-to-end spec_mega/spec_tree (both correct,
 both lose to 275 at B=1) · [remaining] **flat int4 tensor-core M=K verify** — the one thing that flips it.
+
+## 8. End-to-end with a properly-fast draft (measured)
+
+Fixed two draft-speed bugs (spec_mega): the torch.compile cudagraph re-captured every pass (cooperative
+launches poison its pool → manual `torch.cuda.CUDAGraph`), and the eager prime paid ~571ms cuBLAS/SDPA
+autotune each time the context window grew (→ warm all Wc shapes once). **Draft 72→2.3ms.** Chain end-to-end:
+
+| K | tok/s | acc | note |
+|---|---|---|---|
+| 2 | **219** | 1.92 | chain optimum |
+| 3 | 204 | 2.11 | |
+| 5 | 160 | 2.17 | verify cost outruns acceptance |
+
+**Still < 275.** verify(M=3)≈6.6ms is fp32-compute-bound even at small M, so a 2ms draft can't lift chain past
+~220. Also tried the **int4-feature draft** (train on the megakernel's own features, not HF bf16) — MEASURED
+WORSE (chain 1.70 vs 2.11), data-starved: the megakernel harvest is M=1 (~4ms/tok) so only 2500 seqs × 128
+affordable vs the HF draft's 8000 × 224, and the int4-vs-bf16 feature gap (cos 0.99) is too small to offset
+5.6× less data. Net: **spec-decode on the megakernel tops out ~219 (chain) / ~190 (tree); the 275 single-pass
+still wins.** The one lever that flips it remains the flat int4 tensor-core verify.
