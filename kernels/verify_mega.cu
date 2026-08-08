@@ -204,7 +204,7 @@ __global__ void verify_mega(
   }
 }
 
-torch::Tensor verify_mega_launch(
+std::vector<torch::Tensor> verify_mega_launch(
     torch::Tensor Wqkv, torch::Tensor s_qkv, torch::Tensor Wo, torch::Tensor s_o, torch::Tensor n1,
     torch::Tensor Wgu, torch::Tensor s_gu, torch::Tensor Wd, torch::Tensor s_d, torch::Tensor n2,
     torch::Tensor nf, torch::Tensor Wlm, torch::Tensor s_lm,
@@ -237,7 +237,7 @@ torch::Tensor verify_mega_launch(
   void* args[]={&wqkv,&sqkv,&wo,&so,&n1p,&wgu,&sgu,&wd,&sd,&n2p,&nfp,&wlm,&slm,&hp,&kcp,&vcp,
                 &xnp,&qkvp,&gup,&actp,&aop,&pmp,&pdp,&paccp,&lgp,&D,&I,&nl,&V,&ms,&p2,&wph,&sc,&rb,&rm,&ls};
   cudaLaunchCooperativeKernel(fn, grid, nthreads, args, 0, at::cuda::getCurrentCUDAStream());
-  return logits;
+  return {logits, xn};                                    // xn = post-final-norm feature [M,DIM] (EAGLE draft input)
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
