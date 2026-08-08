@@ -131,7 +131,7 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, return_hidden: bool = False):
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
@@ -140,8 +140,9 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
+        h = x                                                            # POST-norm hidden = HF hidden_states[-1] (EAGLE draft feature)
         logits = self.output(x) / self.config.logits_scaling             # Granite logits scale (1.0 for Llama)
-        return logits
+        return (logits, h) if return_hidden else logits
 
     @classmethod
     def from_name(cls, name: str):

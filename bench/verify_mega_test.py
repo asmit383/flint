@@ -27,8 +27,10 @@ def dec1(token, pos):
 def verM(tokens, pos):
     M = len(tokens)
     h = (W["embed"][torch.tensor(tokens, device=dev)].float() * EMB_MULT).to(torch.bfloat16)  # [M, DIM]
+    depth = torch.arange(M, dtype=torch.int32, device=dev)                 # chain: depth = index
+    amask = torch.tril(torch.ones(M, M, dtype=torch.uint8, device=dev))    # chain: causal
     return ver.verify_mega_launch(W["qkv_q"], W["qkv_s"], W["o_q"], W["o_s"], W["n1"], W["gu_q"], W["gu_s"],
-        W["d_q"], W["d_s"], W["n2"], W["nf"], W["lm_q"], W["lm_s"], h, kc, vc, pos, M, SCALE, ROPE, RESID, LOGS)
+        W["d_q"], W["d_s"], W["n2"], W["nf"], W["lm_q"], W["lm_s"], h, kc, vc, depth, amask, pos, M, SCALE, ROPE, RESID, LOGS)
 
 tok = AutoTokenizer.from_pretrained(MODEL)
 text = tok.apply_chat_template([{"role": "user", "content": "Write a python function to sort a list."}],
@@ -44,7 +46,7 @@ for m in range(M):
     toks.append(cur); l = dec1(cur, P + m); ref.append(l.clone()); cur = int(l.argmax())
 
 # verify: same M tokens in ONE launch (overwrites cache[P..P+M-1] with identical K/V)
-vlog = verM(toks, P)                                       # [M, VOCAB]
+vlog, _vf = verM(toks, P)                                  # [M, VOCAB], [M, DIM]
 print(f"prompt {P} tok | M={M} verify @ pos {P}")
 print("per-position rel-L2 (verify vs sequential M=1) and argmax match:")
 ok = True
