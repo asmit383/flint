@@ -21,7 +21,7 @@ MODEL = "ibm-granite/granite-4.1-3b"; CKPT = os.path.join(HERE, "engine/checkpoi
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--draft", default="/root/eagle_ll8k/draft.pt")
-    ap.add_argument("--K", type=int, default=6); ap.add_argument("--W", type=int, default=32)
+    ap.add_argument("--K", type=int, default=3); ap.add_argument("--W", type=int, default=32)  # K=3 = chain net optimum (acc saturates ~2, draft scales with K)
     ap.add_argument("--max-new", type=int, default=256); ap.add_argument("--maxseq", type=int, default=2048)
     ap.add_argument("--selftest", action="store_true"); a = ap.parse_args()
     dev = "cuda"; torch.set_grad_enabled(False)
@@ -45,24 +45,28 @@ def main():
 
     verify = torch.compile(model.forward, mode="reduce-overhead", fullgraph=True)
 
-    def _step(f1, emb1, pos1, kv):                            # one cached rollout step: [1,1,*] in, next (f,tok)
-        fp, kv = draft(f1, emb1, pos1, kv=kv, return_kv=True)
-        f_new = fp[:, -1]
-        return f_new, head_tok(f_new)[0], kv
-    _step_c = torch.compile(_step)                            # fuse the tiny per-step kernels (kills eager overhead)
+    draft.setup_cache(a.W + a.K + 2, dev)                     # fixed KV cache -> the rollout step CUDA-graphs
 
-    def draft_roll(feats, positions, first_tok, K):           # KV-cached rollout: prime context, then O(1) steps
+    def _step(f1, emb1, pos1, slot):                          # one graphed rollout step (fixed [1,1,*] shapes)
+        fp = draft(f1, emb1, pos1, input_pos=slot)
+        f_new = fp[:, -1]
+        return f_new, head_tok(f_new)[0]
+    _step_c = torch.compile(_step, mode="reduce-overhead", fullgraph=True)
+
+    def draft_roll(feats, positions, first_tok, K):           # fixed-cache rollout: prime context, then graphed steps
         lo = max(0, feats.shape[0] - a.W)
         fctx = feats[lo:]; pctx = positions[lo:]; Wc = fctx.shape[0]
         tctx = torch.zeros(Wc, dtype=torch.long, device=dev); tctx[-1] = first_tok
         emb_ctx = F.embedding(tctx, embed).to(torch.bfloat16)
-        fp, kv = draft(fctx.unsqueeze(0), emb_ctx.unsqueeze(0), pctx, return_kv=True)   # prime cache
+        fp = draft(fctx.unsqueeze(0), emb_ctx.unsqueeze(0), pctx, input_pos=torch.arange(Wc, device=dev))  # prime
         f_new = fp[:, -1]; t_new = head_tok(f_new)[0]
-        out = [t_new]; cpos = pctx[-1:] + 1
+        out = [t_new]; cpos = pctx[-1:] + 1; slot = torch.tensor([Wc], device=dev)
         for _ in range(K - 1):
             emb1 = F.embedding(t_new.view(1), embed).to(torch.bfloat16).view(1, 1, -1)
-            f_new, t_new, kv = _step_c(f_new.view(1, 1, -1), emb1, cpos, kv)
-            out.append(t_new); cpos = cpos + 1
+            torch.compiler.cudagraph_mark_step_begin()
+            f_new, t_new = _step_c(f_new.view(1, 1, -1), emb1, cpos, slot)
+            f_new = f_new.clone(); t_new = t_new.clone()      # copy graph outputs before the next replay reuses them
+            out.append(t_new); cpos = cpos + 1; slot = slot + 1
         return torch.stack(out)
 
     def spec_generate(ids, cb):                               # streaming spec-decode; cb(token) per accepted token

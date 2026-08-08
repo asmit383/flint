@@ -37,7 +37,12 @@ class DraftHead(nn.Module):
         self.down = nn.Linear(inter, dim, bias=False)
         self.fout = nn.Linear(dim, self.fdim, bias=False)     # predict next FUSED feature
 
-    def forward(self, feat, emb, positions=None, kv=None, return_kv=False):  # kv=(k,v) cache for O(1) rollout steps
+    def setup_cache(self, max_roll, device, dtype=torch.bfloat16):  # fixed KV cache -> rollout step is CUDA-graphable
+        self.kc = torch.zeros(1, self.nh, max_roll, self.hd, device=device, dtype=dtype)
+        self.vc = torch.zeros(1, self.nh, max_roll, self.hd, device=device, dtype=dtype)
+        self.cmask = torch.tril(torch.ones(max_roll, max_roll, dtype=torch.bool, device=device))
+
+    def forward(self, feat, emb, positions=None, input_pos=None):  # input_pos: fixed-cache slots for graphed decode
         B, T, _ = feat.shape
         if positions is None:
             positions = torch.arange(T, device=feat.device)
@@ -48,11 +53,12 @@ class DraftHead(nn.Module):
         v = self.v(h).view(B, T, self.nh, self.hd).transpose(1, 2)
         cos, sin = rope_cache(positions, self.hd, self.rope_base, feat.device, feat.dtype)
         q = apply_rope(q, cos, sin); k = apply_rope(k, cos, sin)
-        if kv is not None:                                    # append to cache; new token attends to all
-            k = torch.cat([kv[0], k], dim=2); v = torch.cat([kv[1], v], dim=2)
-        att = F.scaled_dot_product_attention(q, k, v, is_causal=(kv is None))
+        if input_pos is not None:                             # write at slot, attend over filled slots (fixed shape)
+            self.kc[:, :, input_pos] = k; self.vc[:, :, input_pos] = v
+            att = F.scaled_dot_product_attention(q, self.kc, self.vc, attn_mask=self.cmask[input_pos])
+        else:
+            att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         x = x + self.o(att.transpose(1, 2).reshape(B, T, self.dim))
         h = rmsnorm(x, self.n2)
         h = x + self.down(F.silu(self.gate(h)) * self.up(h))  # [B,T,dim]
-        out = self.fout(h)                                    # [B,T,fdim] predicted next fused feature
-        return (out, (k, v)) if return_kv else out
+        return self.fout(h)                                   # [B,T,fdim] predicted next fused feature
