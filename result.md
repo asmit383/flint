@@ -105,19 +105,28 @@ it breaks even at best. The verify is **not flat** (register/occupancy-bound: M 
 occupancy, so the extra math doesn't fully hide in the 27%-MBU latency slack). Acceptance being solved
 (2.52/4.28) is necessary but not sufficient — the flat verify is what's missing.
 
-## 7. The path above 275 — what it actually needs
+## 7. Tree-verify — built, and the measured verdict
 
-```
-net tok/s = accepted / (draft_roll_time + verify_time)
-```
-Both remaining levers are real builds:
-- **Flat M=K verify** (`verify_cost(M) → ~1.1–1.2`): the whole-project thesis (B=1 is latency-bound, extra
-  math should hide) says it's possible, but the current kernel is register-bound. With a flat verify: chain
-  2.52/(2ms + 4.5ms) ≈ **388**; tree 4.28/(3ms + 6ms) ≈ **475**.
-- **Tree-verify serving loop** to cash in the 4.28 tree acceptance (tree attention mask in verify_mega,
-  longest-path accept, KV surgery). With today's *non-flat* verify: 4.28/(3ms + 10.6ms) ≈ **315** — the one
-  path that clears 275 without the flat-verify kernel, if live tree acceptance holds near 4.28.
+Built the full EAGLE-2 tree loop on the megakernel (`spec_tree.py` + tree-attention-mask `verify_mega`):
+width-B beam draft → whole-tree verify in ONE int4 launch → longest-path accept → KV surgery. **Output
+matches the sequential greedy exactly** (found + fixed a real kernel bug along the way: the launcher fell
+through to `verify_mega<3>` for any M∉{1,2,4,6,8}, silently corrupting trees). Measured:
 
-**Build order:** [done] self-distill drafter · [done] multi-step rollout training (acc 1.76→2.52 / 2.46→4.28)
-· [done] fixed-cache CUDA-graphed draft rollout · [done] **M=K verify megakernel + end-to-end spec_mega
-(116 tok/s, chain loses at B=1)** · [next] flat M=K verify (register/occupancy) AND/OR tree-verify loop.
+| tree | nodes M | acceptance | verify | net (draft 2ms) |
+|---|---|---|---|---|
+| B=2 D=3 | 7 | 2.51 | 10.3ms | **205** |
+| B=4 D=3 | 13 | 2.82 | 23.0ms | 113 |
+
+**Verdict: at B=1, single-pass (275) beats spec-decode — chain AND tree.** Two measured reasons: (1) live
+tree acceptance is 2.5–2.8, far below the 4.28 *ceiling* (the ceiling feeds true tokens forward; a real tree
+on int4 features doesn't reach it); (2) the verify isn't flat — cost *explodes* at M=13 (23ms) as the M
+fp32 accumulators collapse occupancy. Best net ~244 (draft-free upper bound), below 275.
+
+**The single decisive lever left: a FLAT M=K verify** (`verify_cost → ~1.2`). The scalar fp32 GEMV goes
+compute-bound at M≥4 (~18 FLOP/byte ≈ H100 fp32 balance), so flatness needs **tensor cores** for the int4
+M=K matmul — idle at M=1, filled at M=8. That's the hard, multi-day int4-TC-GEMM. With it: chain
+2.52/(2+4.5) ≈ **388**, tree 2.8/(2+6) ≈ **350+**.
+
+**Build order:** [done] self-distill drafter · [done] multi-step rollout (acc 1.76→2.52 / 2.46→4.28) · [done]
+fixed-cache CUDA-graphed draft · [done] M=K verify megakernel + end-to-end spec_mega/spec_tree (both correct,
+both lose to 275 at B=1) · [remaining] **flat int4 tensor-core M=K verify** — the one thing that flips it.
