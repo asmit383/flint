@@ -56,58 +56,49 @@ def main():
         return ver.verify_mega_launch(W["qkv_q"], W["qkv_s"], W["o_q"], W["o_s"], W["n1"], W["gu_q"], W["gu_s"],
             W["d_q"], W["d_s"], W["n2"], W["nf"], W["lm_q"], W["lm_s"], h, kc, vc, depth, amask, pos, M, SCALE, ROPE, RESID, LOGS)
 
-    # manual CUDA graph for the rollout step — robust to the interleaved cooperative megakernel launches that
-    # poison torch.compile's cudagraph pool (which made the step re-capture every pass = 73ms). Static buffers.
-    fdim = draft.fdim
-    _sf = torch.zeros(1, 1, fdim, device=dev, dtype=torch.bfloat16)
-    _se = torch.zeros(1, 1, DIM, device=dev, dtype=torch.bfloat16)
-    _sp = torch.zeros(1, dtype=torch.long, device=dev); _ss = torch.zeros(1, dtype=torch.long, device=dev)
-    def _step_raw():
-        fp = draft(_sf, _se, _sp, input_pos=_ss); fn = fp[:, -1]
-        return fn, head_tok(fn)[0]
-    for _ in range(3): _step_raw()
+    # WHOLE-rollout CUDA graph: prime(fixed W) + K-1 steps captured as ONE graph. Fixed shapes throughout
+    # (RoPE is relative, so relative positions 0..W-1 are exact), so one capture, minimal launch overhead.
+    fdim = draft.fdim; Wg = a.W
+    _gfeat = torch.zeros(1, Wg, fdim, device=dev, dtype=torch.bfloat16)   # padded context features
+    _gemb = torch.zeros(1, Wg, DIM, device=dev, dtype=torch.bfloat16)     # context token embeds (last = first_tok)
+    _gpos = torch.arange(Wg, device=dev)
+    _sps = [torch.tensor([Wg + i], device=dev) for i in range(a.K - 1)]   # fixed step positions/slots
+    def _roll_raw():
+        fp = draft(_gfeat, _gemb, _gpos, input_pos=_gpos); f_new = fp[:, -1]; t_new = head_tok(f_new)[0]
+        outs = [t_new]
+        for i in range(a.K - 1):
+            emb1 = F.embedding(t_new.view(1), embed).to(torch.bfloat16).view(1, 1, -1)
+            fp = draft(f_new.view(1, 1, -1), emb1, _sps[i], input_pos=_sps[i]); f_new = fp[:, -1]; t_new = head_tok(f_new)[0]
+            outs.append(t_new)
+        return torch.stack(outs)
+    for _ in range(3): _roll_raw()
     torch.cuda.synchronize()
-    _g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(_g): _of, _ot = _step_raw()
+    _rg = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(_rg): _gout = _roll_raw()
 
-    def draft_roll(feats, positions, first_tok, K):        # fixed-cache rollout, graphed step
-        lo = max(0, feats.shape[0] - a.W)
-        fctx = feats[lo:]; pctx = positions[lo:]; Wc = fctx.shape[0]
-        tctx = torch.zeros(Wc, dtype=torch.long, device=dev); tctx[-1] = first_tok
-        emb_ctx = F.embedding(tctx, embed).to(torch.bfloat16)
-        fp = draft(fctx.unsqueeze(0), emb_ctx.unsqueeze(0), pctx, input_pos=torch.arange(Wc, device=dev))  # prime (eager)
-        f_new = fp[:, -1]; t_new = head_tok(f_new)[0]
-        out = [t_new]; cpos = int(pctx[-1]) + 1; slot = Wc
-        for _ in range(K - 1):
-            _sf.copy_(f_new.view(1, 1, -1))
-            _se.copy_(F.embedding(t_new.view(1), embed).to(torch.bfloat16).view(1, 1, -1))
-            _sp.fill_(cpos); _ss.fill_(slot)
-            _g.replay()
-            f_new = _of.clone(); t_new = _ot.clone()
-            out.append(t_new); cpos += 1; slot += 1
-        return torch.stack(out)
-
-    def warm_prime():                                      # pay per-Wc cuBLAS/SDPA autotune ONCE, outside timing
-        for wc in range(1, a.W + 1):
-            df = torch.zeros(1, wc, fdim, device=dev, dtype=torch.bfloat16)
-            de = torch.zeros(1, wc, DIM, device=dev, dtype=torch.bfloat16)
-            draft(df, de, torch.arange(wc, device=dev), input_pos=torch.arange(wc, device=dev))
-        torch.cuda.synchronize()
+    def draft_roll(feats, first_tok):                      # feats [N, fdim] -> [K] proposed tokens (graphed)
+        N = feats.shape[0]
+        if N >= Wg:
+            _gfeat.copy_(feats[N - Wg:].unsqueeze(0))
+        else:                                              # pad front with the oldest feature (relative RoPE)
+            _gfeat[0, Wg - N:].copy_(feats); _gfeat[0, :Wg - N].copy_(feats[0].unsqueeze(0).expand(Wg - N, -1))
+        _gemb.zero_(); _gemb[0, -1].copy_(embed[first_tok.view(-1)[0]].to(torch.bfloat16))
+        _rg.replay()
+        return _gout.clone()
 
     def run(ids, cb):
         pos = 0
         for t in ids[:-1]: dec1(t, pos); pos += 1          # prefill bulk (M=1 megakernel)
         lg, feat = verM([ids[-1]], pos)                    # last prompt tok -> logits + feature
         feats = feat.clone(); pos += 1; nxt = lg[0].argmax().view(1)
-        warm_prime()                                       # warm all Wc prime shapes BEFORE timing
-        draft_roll(feats, torch.arange(pos - feats.shape[0], pos, device=dev), nxt, a.K)   # warmup (positions aligned to feats)
+        draft_roll(feats, nxt)                             # warmup the graph (already captured above)
         torch.cuda.synchronize()
         n = 0; passes = 0; t0 = time.perf_counter(); t_draft = 0.0; t_ver = 0.0
         while n < a.max_new and pos < a.maxseq - a.K - 2:
             cb(nxt.item()); n += 1
             if nxt.item() == eos: break
             torch.cuda.synchronize(); _td = time.perf_counter()
-            d = draft_roll(feats, torch.arange(pos - feats.shape[0], pos, device=dev), nxt, a.K)
+            d = draft_roll(feats, nxt)
             torch.cuda.synchronize(); t_draft += time.perf_counter() - _td; _tv = time.perf_counter()
             cand = torch.cat([nxt, d]).tolist()            # M = K+1
             vlog, vfeat = verM(cand, pos)
